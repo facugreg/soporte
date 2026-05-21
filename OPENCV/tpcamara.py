@@ -20,7 +20,7 @@ while True:
 
     # Cuenta regresiva 
     if contador > 0:
-        cv2.putText(frame, str(contador // 20 + 1), (290, 260),
+        cv2.putText(frame, str(contador // 30 + 1), (290, 260),
                     cv2.FONT_HERSHEY_SIMPLEX, 5, (0, 255, 255), 8)
         contador -= 1
 
@@ -39,7 +39,7 @@ while True:
     if tecla == ord('q'):
         break
     elif tecla == ord('f'):          # F = foto
-        contador = 60                # 60 frames ≈ 3 segundos
+        contador = 90                # 60 frames ≈ 3 segundos
     elif tecla == ord('r'):          # R = grabar / detener
         if not grabando:
             fourcc = cv2.VideoWriter_fourcc(*'XVID')

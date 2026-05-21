@@ -18,6 +18,7 @@ TabbedPanel:
                 color: 0.3, 0.3, 0.3, 1
             Widget:
                 size_hint_y: 1
+
     TabbedPanelItem:
         text: 'Pestaña 2'
         BoxLayout:
@@ -28,10 +29,41 @@ TabbedPanel:
                 text: 'contenido tab2'
                 size_hint_y: None
                 height: 40
-            Button:
-                text: 'Botón'
+            Label:
+                id: contador_label
+                text: '0'
+                font_size: 48
+                size_hint_y: None
+                height: 80
+                halign: 'center'
+                text_size: self.size
+                color: 0.2, 0.6, 1, 1
+            BoxLayout:
+                orientation: 'horizontal'
                 size_hint_y: None
                 height: 44
+                spacing: 10
+                Button:
+                    text: '-'
+                    font_size: 28
+                    background_color: 1, 0.3, 0.3, 1
+                    on_press:
+                        contador_label.text = str(int(contador_label.text) - 1)
+                Button:
+                    text: '+'
+                    font_size: 28
+                    background_color: 0.2, 0.8, 0.4, 1
+                    on_press:
+                        contador_label.text = str(int(contador_label.text) + 1)
+            Button:
+                text: 'Reset'
+                size_hint_y: None
+                height: 44
+                background_color: 0.5, 0.5, 0.5, 1
+                on_press:
+                    contador_label.text = '0'
+            Widget:
+                size_hint_y: 1
 
     TabbedPanelItem:
         text: 'Pestaña 3'
@@ -68,6 +100,7 @@ TabbedPanel:
                 size_hint_y: None
                 height: 44
                 background_color: 0.2, 0.6, 1, 1
+
     TabbedPanelItem:
         text: 'Pestaña 4'
         BoxLayout:
