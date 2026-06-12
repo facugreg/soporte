@@ -70,7 +70,7 @@ PELOTA_HSV_ALTO = np.array([45, 255, 255])
 # =============================================================================
 
 def detectar_jugador(frame_hsv, mascara_mov, hsv_bajo, hsv_alto,
-                     hsv_bajo2=None, hsv_alto2=None, area_min=300):
+                     hsv_bajo2=None, hsv_alto2=None, area_min=300, area_max=8000):
     mascara_color = cv2.inRange(frame_hsv, hsv_bajo, hsv_alto)
     if hsv_bajo2 is not None:
         mascara_color = cv2.bitwise_or(
@@ -86,14 +86,77 @@ def detectar_jugador(frame_hsv, mascara_mov, hsv_bajo, hsv_alto,
     if not contornos:
         return None
 
-    c = max(contornos, key=cv2.contourArea)
-    if cv2.contourArea(c) < area_min:
+    # Filtrar por rango de área válido antes de elegir el contorno mayor.
+    # Contornos demasiado grandes son ruido o partes fuera del frame, no el jugador.
+    contornos = [c for c in contornos if area_min <= cv2.contourArea(c) <= area_max]
+    if not contornos:
         return None
 
-    M = cv2.moments(c)
-    if M["m00"] == 0:
+    c = max(contornos, key=cv2.contourArea)
+
+    # Bounding box del contorno
+    x, y, w, h = cv2.boundingRect(c)
+
+    # Usamos el centro horizontal + la parte BAJA del box (los pies)
+    # Esto evita que el swing de la raqueta desplace el punto hacia arriba
+    cx = x + w // 2
+    cy = y + h          # <-- punto más bajo = pies
+    return (cx, cy)
+
+# =============================================================================
+# MÓDULO 1b — DETECCIÓN DE FRANK POR COLOR HSV + EXTRAPOLACIÓN DE PIES
+# =============================================================================
+
+def detectar_frank_hsv(frame_hsv, mascara_mov, hsv_bajo, hsv_alto,
+                       hsv_bajo2=None, hsv_alto2=None, area_min=300, area_max=8000,
+                       y_min_pies=300, y_max_pies=540):
+    """
+    Detecta a Frank por el color de su remera roja y localiza los pies buscando
+    el píxel más bajo con movimiento en la franja debajo del bounding box de la remera.
+    Zona válida de pies: y_min_pies..y_max_pies en coordenadas del frame escalado.
+    """
+    mascara_color = cv2.inRange(frame_hsv, hsv_bajo, hsv_alto)
+    if hsv_bajo2 is not None:
+        mascara_color = cv2.bitwise_or(
+            mascara_color, cv2.inRange(frame_hsv, hsv_bajo2, hsv_alto2))
+
+    mascara = cv2.bitwise_and(mascara_mov, mascara_color)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mascara = cv2.morphologyEx(mascara, cv2.MORPH_OPEN,  kernel)
+    mascara = cv2.morphologyEx(mascara, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    contornos, _ = cv2.findContours(mascara, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contornos:
         return None
-    return (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
+
+    contornos = [c for c in contornos if area_min <= cv2.contourArea(c) <= area_max]
+    if not contornos:
+        return None
+
+    c = max(contornos, key=cv2.contourArea)
+    x, y, w, h = cv2.boundingRect(c)
+    cx = x + w // 2
+
+    # Buscar el píxel más bajo con movimiento en la franja debajo de la remera
+    # (zona x_center±30, desde el borde inferior de la remera hasta ~2x su altura)
+    h_frame = mascara_mov.shape[0]
+    x_izq  = max(0, cx - 30)
+    x_der  = min(mascara_mov.shape[1], cx + 30)
+    y_top  = y + h
+    y_bot  = min(h_frame, y + h * 2)
+
+    filas_con_mov = np.where(mascara_mov[y_top:y_bot, x_izq:x_der].any(axis=1))[0]
+    if len(filas_con_mov) > 0:
+        cy = y_top + int(filas_con_mov[-1])
+    else:
+        cy = int(y + h + h * 0.8)  # fallback: 80% de la altura por debajo de la remera
+
+    # Descartar si los pies caen fuera de la zona válida de Frank
+    if not (y_min_pies <= cy <= y_max_pies):
+        return None
+
+    return (cx, cy)
 
 # =============================================================================
 # MÓDULO 2 — DETECCIÓN DE LA PELOTA (contorno, sin HoughCircles)
@@ -200,100 +263,141 @@ def dibujar_overlay(frame, frame_num, fps, pos_frank, pos_tim, pos_pelota,
 # MÓDULO 5 — IMAGEN FINAL: VISTA AÉREA DE LA CANCHA CON TRAYECTORIAS
 # =============================================================================
 
-def guardar_resumen_cancha(todos_frank, todos_tim, todos_pelota,
-                           ancho_video, alto_video,
-                           dist_frank_m, dist_tim_m,
-                           ruta="resumen_cancha.png"):
+def guardar_resumen_cancha(todos_frank, ruta="resumen_cancha.png"):
     """
-    Genera una imagen estilo 'vista aérea' con la cancha de tenis dibujada
-    y las trayectorias completas de ambos jugadores y la pelota.
-    Las coordenadas del video se mapean a la cancha esquemática.
+    Genera imagen con la cancha de tenis vista de frente (orientación portrait)
+    y el recorrido completo de Frank (jugador más cercano a la cámara).
     """
+    # Filtrar solo puntos válidos
+    puntos = [p for p in todos_frank if p is not None]
+    print(f"Puntos válidos de Frank: {len(puntos)}")
+    if len(puntos) < 10:
+        print(f"  Primeros valores de todos_frank: {todos_frank[:5]}")
+    if len(puntos) < 2:
+        print("  No hay suficientes puntos para graficar.")
+        return
+
+    # Suavizar la trayectoria para eliminar saltos de detección
+    # Usamos una media móvil simple sobre x e y por separado
+    ventana = 5
+    xs_raw = [p[0] for p in puntos]
+    ys_raw = [p[1] for p in puntos]
+
+    def suavizar(vals, v):
+        resultado = []
+        for i in range(len(vals)):
+            inicio = max(0, i - v // 2)
+            fin    = min(len(vals), i + v // 2)
+            resultado.append(sum(vals[inicio:fin]) / (fin - inicio))
+        return resultado
+
+    xs = suavizar(xs_raw, ventana)
+    ys = suavizar(ys_raw, ventana)
+
+    # Eliminar saltos bruscos (teleportaciones por falsa detección)
+    # Si entre dos frames consecutivos el jugador "salta" más de MAX_SALTO píxeles, lo descartamos
+    MAX_SALTO = 200
+    xs_limpios, ys_limpios = [xs[0]], [ys[0]]
+    for i in range(1, len(xs)):
+        dx = xs[i] - xs_limpios[-1]
+        dy = ys[i] - ys_limpios[-1]
+        if (dx**2 + dy**2) ** 0.5 < MAX_SALTO:
+            xs_limpios.append(xs[i])
+            ys_limpios.append(ys[i])
+
+    # --- Figura con cancha dibujada en matplotlib ---
     fig, ax = plt.subplots(figsize=(10, 7))
-    fig.patch.set_facecolor("#1a1a2e")
-    ax.set_facecolor("#1565C0")   # azul cancha
+    fig.patch.set_facecolor("#0d1b2a")
+    ax.set_facecolor("#0d1b2a")
 
-    # --- Dibujar cancha ---
-    # Dimensiones normalizadas: cancha ocupa el 80% del área del plot
-    W, H = 10, 7   # unidades del plot
+    # Área de la cancha (fondo azul claro)
+    ax.add_patch(plt.Rectangle((0.5, 0.5), 9.0, 6.0,
+                                color="#2E86C1", zorder=1))
 
-    def linea(x1, y1, x2, y2, lw=1.5):
-        ax.plot([x1, x2], [y1, y2], color="white", linewidth=lw, zorder=2)
+    def L(x1, y1, x2, y2, lw=1.5):
+        ax.plot([x1, x2], [y1, y2], color="white", linewidth=lw,
+                solid_capstyle="round", zorder=2)
 
-    # Borde exterior
-    linea(1, 0.8, 9, 0.8)
-    linea(1, 6.2, 9, 6.2)
-    linea(1, 0.8, 1, 6.2)
-    linea(9, 0.8, 9, 6.2)
+    # Rectángulo exterior
+    L(0.5, 0.5, 9.5, 0.5)   # fondo inferior
+    L(0.5, 6.5, 9.5, 6.5)   # fondo superior
+    L(0.5, 0.5, 0.5, 6.5)   # lateral izquierdo
+    L(9.5, 0.5, 9.5, 6.5)   # lateral derecho
 
-    # Red (centro)
-    linea(5, 0.8, 5, 6.2, lw=2.5)
+    # Red (centro, vertical)
+    ax.plot([5, 5], [0.5, 6.5], color="white", linewidth=3,
+            solid_capstyle="round", zorder=2)
 
-    # Línea de servicio izquierda
-    linea(3, 2.1, 3, 4.9)
-    # Línea de servicio derecha
-    linea(7, 2.1, 7, 4.9)
-    # Centro de servicio
-    linea(3, 3.5, 7, 3.5)
+    # Líneas de singles
+    L(0.5, 1.3, 9.5, 1.3)
+    L(0.5, 5.7, 9.5, 5.7)
 
-    # Líneas laterales de dobles
-    linea(1, 2.1, 9, 2.1)
-    linea(1, 4.9, 9, 4.9)
+    # Líneas de servicio
+    L(2.5, 1.3, 2.5, 5.7)
+    L(7.5, 1.3, 7.5, 5.7)
 
-    # --- Mapear coordenadas video → cancha ---
-    def mapear(puntos_video):
-        coords = []
-        for p in puntos_video:
-            if p is None:
-                coords.append(None)
-            else:
-                # Normalizar coordenadas del video al espacio de la cancha
-                px = 1 + (p[0] / ancho_video) * 8
-                py = 0.8 + (p[1] / alto_video) * 5.4
-                coords.append((px, py))
-        return coords
+    # Línea central de servicio
+    L(2.5, 3.5, 7.5, 3.5)
 
-    frank_mapped  = mapear([p for p in todos_frank  if p is not None])
-    tim_mapped    = mapear([p for p in todos_tim    if p is not None])
-    pelota_mapped = mapear([p for p in todos_pelota if p is not None])
+    # --- Mapear coordenadas del video a la cancha landscape ---
+    # Calibración con referencias reales del video en coords ORIGINALES (1920x1080).
+    # Los valores escalados del enunciado se multiplican x2 porque todos_frank
+    # almacena posiciones en coords originales (tras escalar() con ESCALA=0.5).
+    #
+    # mapear_x: video x (ancho de cancha visto desde cámara) → plot x (profundidad)
+    #   x=480 orig (lateral izq singles, x=240 esc) → plot x=5  (red)
+    #   x=1380 orig (lateral der singles, x=690 esc) → plot x=9.2 (fondo Frank)
+    #
+    # mapear_y: video y (profundidad en frame) → plot y (ancho de cancha), invertido
+    #   y=430 orig (red, y=215 esc) → plot y=5.7 (lateral superior)
+    #   y=950 orig (fondo, y=475 esc) → plot y=1.3 (lateral inferior)
 
-    def dibujar_tray_plot(coords, color, label, alpha_line=0.6, lw=2):
-        xs = [c[0] for c in coords if c]
-        ys = [c[1] for c in coords if c]
-        if len(xs) < 2:
-            return
-        # Dibujar segmentos con degradado de opacidad
-        n = len(xs)
-        for i in range(1, n):
-            a = 0.15 + 0.85 * (i / n)
-            ax.plot([xs[i-1], xs[i]], [ys[i-1], ys[i]],
-                    color=color, alpha=a, linewidth=lw, zorder=3)
-        # Punto final (posición actual)
-        ax.scatter(xs[-1], ys[-1], color=color, s=80, zorder=5,
-                   edgecolors="white", linewidths=1.2, label=label)
+    def mapear_x(px):
+        return 5 + ((px - 480) / (1380 - 480)) * 4.2
 
-    # Colores matplotlib (RGB 0-1)
-    dibujar_tray_plot(frank_mapped,  "#FF5733", f"Frank  ({dist_frank_m:.0f} m)")
-    dibujar_tray_plot(tim_mapped,    "#4FC3F7", f"Tim    ({dist_tim_m:.0f} m)")
-    dibujar_tray_plot(pelota_mapped, "#FFEB3B", "Pelota", alpha_line=0.8, lw=1)
+    def mapear_y(py):
+        return 5.7 - ((py - 430) / (950 - 430)) * 4.4
 
-    # --- Etiquetas de zonas ---
-    ax.text(2.7, 3.5, "ZONA\nSERVICIO", color="white", fontsize=7,
-            ha="center", va="center", alpha=0.4)
-    ax.text(7.3, 3.5, "ZONA\nSERVICIO", color="white", fontsize=7,
-            ha="center", va="center", alpha=0.4)
-    ax.text(5.0, 6.5, "RED", color="white", fontsize=8,
-            ha="center", va="center", alpha=0.6)
+    xm = [mapear_x(x) for x in xs_limpios]
+    ym = [mapear_y(y) for y in ys_limpios]
+
+    # Descartar puntos fuera del lado de Frank o fuera del área visible de la cancha
+    pares_validos = [(xi, yi) for xi, yi in zip(xm, ym)
+                     if 5 <= xi <= 9.5 and 0.5 <= yi <= 6.5]
+    if len(pares_validos) < 2:
+        print("  No hay suficientes puntos en la mitad de cancha de Frank tras filtrar.")
+        return
+    xm, ym = zip(*pares_validos)
+    xm, ym = list(xm), list(ym)
+
+    # --- Dibujar trayectoria con degradado de color (inicio=azul oscuro → fin=rojo) ---
+    n = len(xm)
+    for i in range(1, n):
+        t = i / n
+        r = int(180 * t + 40 * (1 - t))
+        g = int(20  * t + 80 * (1 - t))
+        b = int(20  * t + 180 * (1 - t))
+        color_hex = f"#{r:02x}{g:02x}{b:02x}"
+        lw = 1.5 + t * 1.5
+        ax.plot([xm[i-1], xm[i]], [ym[i-1], ym[i]],
+                color=color_hex, linewidth=lw, alpha=0.85,
+                solid_capstyle="round", zorder=3)
+
+    # Punto de inicio (círculo hueco) y punto final (círculo sólido)
+    ax.scatter(xm[0],  ym[0],  s=80,  color="#4FC3F7", zorder=6,
+               edgecolors="white", linewidths=1.5, label="Inicio")
+    ax.scatter(xm[-1], ym[-1], s=100, color="#FF5733", zorder=6,
+               edgecolors="white", linewidths=1.5, label="Fin")
 
     # --- Leyenda y títulos ---
-    legend = ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.12),
-                       ncol=3, frameon=True, facecolor="#1a1a2e",
-                       edgecolor="white", labelcolor="white", fontsize=10)
+    ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.07), ncol=2,
+              frameon=True, facecolor="#0d1b2a", edgecolor="white",
+              labelcolor="white", fontsize=10, markerscale=1.2)
 
-    ax.set_title("Trayectorias del partido — Vista aérea",
-                 color="white", fontsize=14, pad=12)
-    ax.set_xlim(0, W)
-    ax.set_ylim(0, H + 0.5)
+    ax.set_title("Recorrido de Frank  (mitad derecha de la cancha)",
+                 color="white", fontsize=13, pad=14, fontweight="bold")
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 7)
     ax.axis("off")
 
     plt.tight_layout()
@@ -358,9 +462,18 @@ def procesar_video(ruta_entrada, ruta_salida="video_procesado.mp4"):
         sys.exit(1)
 
     fps_orig = cap.get(cv2.CAP_PROP_FPS)
-    ancho    = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    alto     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total    = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+    # Leer el primer frame para obtener las dimensiones REALES del frame.
+    # cap.get(CAP_PROP_FRAME_WIDTH/HEIGHT) puede devolver valores distintos
+    # a los del frame real (diferencia entre tamaño de display y tamaño codificado),
+    # lo que hace que el VideoWriter recorte los frames silenciosamente.
+    ret_test, frame_test = cap.read()
+    if not ret_test:
+        print(f"ERROR: No se puede leer el primer frame de '{ruta_entrada}'")
+        sys.exit(1)
+    alto, ancho = frame_test.shape[:2]
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # volver al inicio
 
     # Dimensiones escaladas para procesamiento interno
     ancho_proc = int(ancho * ESCALA)
@@ -417,9 +530,9 @@ def procesar_video(ruta_entrada, ruta_salida="video_procesado.mp4"):
         frame_hsv = cv2.cvtColor(pequeño, cv2.COLOR_BGR2HSV)
 
         # Detectar en coordenadas pequeñas
-        pos_frank_p  = detectar_jugador(frame_hsv, mascara_mov,
-                                        FRANK_HSV_BAJO, FRANK_HSV_ALTO,
-                                        FRANK_HSV_BAJO2, FRANK_HSV_ALTO2)
+        pos_frank_p  = detectar_frank_hsv(frame_hsv, mascara_mov,
+                                          FRANK_HSV_BAJO, FRANK_HSV_ALTO,
+                                          FRANK_HSV_BAJO2, FRANK_HSV_ALTO2)
         pos_tim_p    = detectar_jugador(frame_hsv, mascara_mov,
                                         TIM_HSV_BAJO, TIM_HSV_ALTO)
         pos_pelota_p = detectar_pelota(frame_hsv, PELOTA_HSV_BAJO, PELOTA_HSV_ALTO)
@@ -460,9 +573,15 @@ def procesar_video(ruta_entrada, ruta_salida="video_procesado.mp4"):
                         pos_frank, pos_tim, pos_pelota,
                         dist_frank_px, dist_tim_px)
 
+        # Garantía explícita: solo se escribe el frame original sin resize.
+        # Si por cualquier razón el shape no coincide, se corrige antes de escribir
+        # para evitar el efecto de zoom/recorte silencioso del VideoWriter.
+        if frame.shape[1] != ancho or frame.shape[0] != alto:
+            frame = cv2.resize(frame, (ancho, alto))
         writer.write(frame)
 
-        cv2.imshow("Analisis Tenis - OpenCV", frame)
+        preview = cv2.resize(frame, (frame.shape[1] // 2, frame.shape[0] // 2))
+        cv2.imshow("Analisis Tenis - OpenCV", preview)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             print("  Cancelado por el usuario.")
             break
@@ -474,13 +593,9 @@ def procesar_video(ruta_entrada, ruta_salida="video_procesado.mp4"):
     print(f"\nVideo guardado en: {ruta_salida}")
 
     fps_ef = fps_orig / FRAME_SKIP
-    dist_f, dist_t = exportar_metricas(todos_frank, todos_tim, fps_ef)
+    # dist_f, dist_t = exportar_metricas(todos_frank, todos_tim, fps_ef)
 
-    guardar_resumen_cancha(
-        todos_frank, todos_tim, todos_pelota,
-        ancho, alto,
-        dist_f, dist_t
-    )
+    guardar_resumen_cancha(todos_frank)
 
 # =============================================================================
 # UTILIDAD: CALIBRADOR HSV
