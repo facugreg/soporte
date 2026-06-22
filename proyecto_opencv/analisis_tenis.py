@@ -22,36 +22,53 @@ import matplotlib.pyplot as plt
 from collections import deque
 from pathlib import Path
 import sys
+import os
+import urllib.request
 
 # ============================================================
 # CONFIGURACIÓN
 # ============================================================
 
-FRAME_SKIP = 2
+FRAME_SKIP = 4
 
 # Vista cenital
 HSV_CANCHA_BAJO = np.array([85,  40,  60])
 HSV_CANCHA_ALTO = np.array([160, 255, 255])
 UMBRAL_CENITAL  = 0.25
 
-# Polígono exacto de la cancha en el video (perspectiva trapezoidal)
-CANCHA_PUNTOS = np.array([
-    [630, 190],   # Superior izquierda
-    [1334, 202],  # Superior derecha
-    [1734, 864],  # Inferior derecha
-    [310, 836],   # Inferior izquierda
+# Zona de tracking — máscara de exclusión (rectángulo rojo)
+ZONA_TRACKING = np.array([
+    [606,  160],
+    [1380, 180],
+    [1782, 980],
+    [262,  960],
 ], dtype=np.int32)
+
+# Cancha exacta — solo para mapeo de perspectiva a cancha.png (trapecio verde)
+CANCHA_PUNTOS = np.array([
+    [684,  190],   # Superior izquierda
+    [1240, 200],   # Superior derecha
+    [1506, 840],   # Inferior derecha
+    [408,  828],   # Inferior izquierda
+], dtype=np.int32)
+
+# Red — separa Jugador A (cercano) de Jugador B (lejano)
+RED_IZQ = (600,  416)
+RED_DER = (1326, 426)
 
 # Zona del árbitro a excluir (silla, borde izquierdo)
 ARBITRO_X_MAX = 330
 ARBITRO_Y_MAX = 400
 
-# Jugadores — MOG2
-JUGADOR_AREA_MIN  = 800
-JUGADOR_AREA_MAX  = 25000
-JUGADOR_MAX_SALTO = 80     # px en frame original
+# YOLO — detección de jugadores
+YOLO_MODEL_PATH   = "yolov8n.onnx"
+YOLO_MODEL_URL    = "https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n.onnx"
+YOLO_CONF_THRESH  = 0.4
+YOLO_ASPECT_MIN   = 0.8    # h/w mínimo: persona parada es más alta que ancha
+
+# Filtro temporal de jugadores
+JUGADOR_MAX_SALTO = 150    # px en frame original
 JUGADOR_MAX_PERD  = 5
-MITAD_Y           = 395    # cy > MITAD_Y → Jugador A (cercano); otro → B (lejano)
 
 # MOG2
 MOG2_HISTORY       = 500
@@ -97,63 +114,103 @@ def es_cenital(pequeño_hsv):
 
 
 # ============================================================
-# MÓDULO 1 — DETECCIÓN DE JUGADORES CON MOG2
+# MÓDULO 1 — DETECCIÓN DE JUGADORES CON YOLO
 # ============================================================
 
-def detectar_jugadores_mog2(mask_mog, mascara_cancha):
-    """
-    Aplica la máscara poligonal al resultado de MOG2 y encuentra los dos
-    contornos más grandes como jugadores.
-    Jugador A: centroide con cy > MITAD_Y (mitad inferior, cercano a cámara).
-    Jugador B: centroide con cy < MITAD_Y (mitad superior, lejano).
-    Excluye la zona del árbitro (x < ARBITRO_X_MAX, y < ARBITRO_Y_MAX).
-    """
-    mask = cv2.bitwise_and(mask_mog, mascara_cancha)
+def y_red_en_x(x):
+    """Interpola la y de la red en la posición x del centroide."""
+    t = (x - RED_IZQ[0]) / (RED_DER[0] - RED_IZQ[0])
+    return RED_IZQ[1] + t * (RED_DER[1] - RED_IZQ[1])
 
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
-    mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask   = cv2.dilate(mask, kernel, iterations=2)
 
-    contornos, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
-                                    cv2.CHAIN_APPROX_SIMPLE)
+def _cargar_yolo():
+    if not os.path.exists(YOLO_MODEL_PATH):
+        print(f"ERROR: No se encuentra {YOLO_MODEL_PATH}")
+        print("Descargá el modelo manualmente desde:")
+        print("https://github.com/ultralytics/assets/releases/latest/download/yolov8n.onnx")
+        print(f"y guardalo en la carpeta del proyecto como '{YOLO_MODEL_PATH}'")
+        sys.exit(1)
+    net = cv2.dnn.readNetFromONNX(YOLO_MODEL_PATH)
+    print(f"  YOLOv8n cargado: {YOLO_MODEL_PATH}")
+    return net
+
+def detectar_con_yolo(frame, net, conf_thresh=YOLO_CONF_THRESH):
+    """
+    Corre YOLOv8n sobre el frame y retorna lista de bounding boxes
+    de personas (clase 0) con confianza > conf_thresh.
+    Retorna lista de (x1, y1, x2, y2, confianza).
+    """
+    h, w = frame.shape[:2]
+    blob = cv2.dnn.blobFromImage(frame, 1 / 255.0, (640, 640),
+                                  swapRB=True, crop=False)
+    net.setInput(blob)
+    outputs = net.forward()
+    # YOLOv8 output: (1, 84, 8400) → outputs[0] es (84, 8400)
+    out = outputs[0]
+
+    boxes = []
+    for i in range(out.shape[1]):
+        scores   = out[4:, i]
+        class_id = int(np.argmax(scores))
+        conf     = float(scores[class_id])
+        if class_id != 0 or conf < conf_thresh:
+            continue
+        cx, cy, bw, bh = out[0, i], out[1, i], out[2, i], out[3, i]
+        x1 = int((cx - bw / 2) / 640 * w)
+        y1 = int((cy - bh / 2) / 640 * h)
+        x2 = int((cx + bw / 2) / 640 * w)
+        y2 = int((cy + bh / 2) / 640 * h)
+        boxes.append((x1, y1, x2, y2, conf))
+    return boxes
+
+
+def separar_jugadores_yolo(boxes):
+    """
+    Toma la lista de (x1,y1,x2,y2,conf) de YOLO y retorna
+    (torso_A, zap_A, bbox_A, conf_A, torso_B, zap_B, bbox_B, conf_B).
+    Filtra por centroide en ZONA_TRACKING, aspect ratio h/w >= YOLO_ASPECT_MIN
+    y separación respecto a la línea de red con margen ±20 px.
+    """
     cands_A, cands_B = [], []
 
-    for c in contornos:
-        area = cv2.contourArea(c)
-        if not (JUGADOR_AREA_MIN <= area <= JUGADOR_AREA_MAX):
-            continue
-        M_mom = cv2.moments(c)
-        if M_mom["m00"] == 0:
-            continue
-        cx = int(M_mom["m10"] / M_mom["m00"])
-        cy = int(M_mom["m01"] / M_mom["m00"])
-
-        # Rechazar si el centroide cae fuera del polígono
-        if cv2.pointPolygonTest(CANCHA_PUNTOS, (float(cx), float(cy)), False) < 0:
+    for (x1, y1, x2, y2, conf) in boxes:
+        bw = x2 - x1
+        bh = y2 - y1
+        if bw <= 0 or bh <= 0:
             continue
 
-        # Excluir zona del árbitro
+        if bh / bw < YOLO_ASPECT_MIN:
+            continue
+
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+
+        if cv2.pointPolygonTest(ZONA_TRACKING, (float(cx), float(cy)), False) < 0:
+            continue
+
         if cx < ARBITRO_X_MAX and cy < ARBITRO_Y_MAX:
             continue
 
-        x, y, w, h = cv2.boundingRect(c)
-        pos  = (cx, y + h)          # punto de tracking: centro-x, pies
-        bbox = (x, y, x + w, y + h)
+        torso = (cx, cy)
+        zap   = (cx, y2)
+        bbox  = (x1, y1, x2, y2)
+        area  = bw * bh
 
-        if cy > MITAD_Y:
-            cands_A.append((area, pos, bbox))
-        else:
-            cands_B.append((area, pos, bbox))
+        y_red = y_red_en_x(cx)
+        if cy > y_red + 20:
+            cands_A.append((area, torso, zap, bbox, conf))
+        elif cy < y_red - 20:
+            cands_B.append((area, torso, zap, bbox, conf))
 
     def mejor(cands):
         if not cands:
-            return None, None
-        _, pos, bbox = max(cands, key=lambda c: c[0])
-        return pos, bbox
+            return None, None, None, None
+        _, torso, zap, bbox, conf = max(cands, key=lambda c: c[0])
+        return torso, zap, bbox, conf
 
-    pos_A, bbox_A = mejor(cands_A)
-    pos_B, bbox_B = mejor(cands_B)
-    return pos_A, bbox_A, pos_B, bbox_B
+    torso_A, zap_A, bbox_A, conf_A = mejor(cands_A)
+    torso_B, zap_B, bbox_B, conf_B = mejor(cands_B)
+    return torso_A, zap_A, bbox_A, conf_A, torso_B, zap_B, bbox_B, conf_B
 
 
 def filtrar_temporal(pos_nueva, ultima_pos, frames_sin):
@@ -182,13 +239,16 @@ def filtrar_temporal(pos_nueva, ultima_pos, frames_sin):
 # MÓDULO 2 — DETECCIÓN DE PELOTA
 # ============================================================
 
-def detectar_pelota(frame_hsv, mascara_cancha, ultima_pelota=None):
+def detectar_pelota(frame_hsv, mascara_cancha, ultima_pelota=None, mask_mog=None):
     """
     Detecta la pelota por filtro HSV dentro del polígono de la cancha.
+    Si mask_mog se provee (MOG2), lo aplica como filtro adicional de movimiento.
     Aplica consistencia temporal: no puede saltar más de PELOTA_MAX_SALTO px.
     """
     mask = cv2.inRange(frame_hsv, PELOTA_HSV_BAJO, PELOTA_HSV_ALTO)
     mask = cv2.bitwise_and(mask, mascara_cancha)
+    if mask_mog is not None:
+        mask = cv2.bitwise_and(mask, mask_mog)
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     mask   = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
@@ -249,23 +309,47 @@ def detectar_golpe(hist_pelota, ultimo_golpe_p, proc_actual):
 # MÓDULO 3 — TRANSFORMACIÓN DE PERSPECTIVA
 # ============================================================
 
+def _leer_puntos_calibracion(ruta="calibracion.txt"):
+    """
+    Parsea calibracion.txt (generado por calibrar.py) y retorna los 4 primeros
+    puntos como np.float32, o None si el archivo no existe o está incompleto.
+    """
+    try:
+        with open(ruta, encoding="utf-8") as f:
+            contenido = f.read()
+        pts = []
+        for linea in contenido.splitlines():
+            linea = linea.strip()
+            if linea.startswith("[") and linea.endswith("],"):
+                nums = linea.strip("[],").split(",")
+                if len(nums) == 2:
+                    pts.append([int(nums[0].strip()), int(nums[1].strip())])
+        if len(pts) >= 4:
+            print(f"  Calibracion leida desde {ruta}: {len(pts)} puntos")
+            return np.float32(pts[:4])
+    except Exception:
+        pass
+    return None
+
+
 def crear_transformacion(img_cancha_rgb):
     """
     Calcula la homografía: 4 vértices del trapecio en el video
-    → zona de juego en cancha.png.
+    → zona de juego en cancha.png (portrait, red al 50% vertical).
+    Lee pts_video de calibracion.txt si existe; si no, usa CANCHA_PUNTOS.
     """
     H, W = img_cancha_rgb.shape[:2]
-    pts_video = np.float32([
-        [320,  155],
-        [995,  155],
-        [1240, 635],
-        [55,   635]
-    ])
+
+    pts_video = _leer_puntos_calibracion()
+    if pts_video is None:
+        pts_video = np.float32(CANCHA_PUNTOS[:4])
+        print("  Usando CANCHA_PUNTOS hardcodeados para la transformacion.")
+
     pts_cancha = np.float32([
-        [W * 0.18, H * 0.02],
-        [W * 0.82, H * 0.02],
-        [W * 0.82, H * 0.98],
-        [W * 0.18, H * 0.98],
+        [W * 0.20, H * 0.03],   # sup-izq → fondo lejano izq (Jugador B)
+        [W * 0.80, H * 0.03],   # sup-der → fondo lejano der
+        [W * 0.80, H * 0.97],   # inf-der → fondo cercano der (Jugador A)
+        [W * 0.20, H * 0.97],   # inf-izq → fondo cercano izq
     ])
     return cv2.getPerspectiveTransform(pts_video, pts_cancha)
 
@@ -292,18 +376,16 @@ def dibujar_cola(frame, cola, color, radio_max=4):
         cv2.circle(frame, p, max(1, int(radio_max * alpha)), c, -1)
 
 
-def dibujar_jugador(frame, pos, bbox, color_bbox, nombre):
-    if bbox is not None:
-        x1, y1, x2, y2 = bbox
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color_bbox, 2)
-        cv2.putText(frame, nombre, (x1, max(y1 - 8, 12)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color_bbox, 2, cv2.LINE_AA)
-    if pos is not None:
-        cv2.circle(frame, pos, 9,  (255, 255, 255), -1)
-        cv2.circle(frame, pos, 7,  color_bbox,      -1)
+def dibujar_jugador(frame, torso, zap, color, nombre):
+    if torso is not None and zap is not None:
+        cv2.line(frame, torso, zap, color, 2, cv2.LINE_AA)
+        cv2.circle(frame, torso, 15, (0, 0, 200),     -1)   # rojo — torso
+        cv2.circle(frame, zap,    8, (255, 255, 255),  -1)   # blanco — zapatillas
+        cv2.putText(frame, nombre, (torso[0] + 18, torso[1] - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2, cv2.LINE_AA)
 
 
-def dibujar_overlay(frame, frame_num, fps, golpes, pos_A, pos_B):
+def dibujar_overlay(frame, frame_num, fps, golpes, torso_A, torso_B):
     h  = frame.shape[0]
     px, py = 8, h - 80
 
@@ -318,8 +400,8 @@ def dibujar_overlay(frame, frame_num, fps, golpes, pos_A, pos_B):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1, cv2.LINE_AA)
 
     txt(f"t = {t:.1f}s  |  Golpes: {golpes}", 22)
-    txt(f"Jugador A: {'detectado' if pos_A else 'no detectado'}", 46, COLOR_BBOX_A)
-    txt(f"Jugador B: {'detectado' if pos_B else 'no detectado'}", 68, COLOR_BBOX_B)
+    txt(f"Jugador A: {'detectado' if torso_A else 'no detectado'}", 46, COLOR_BBOX_A)
+    txt(f"Jugador B: {'detectado' if torso_B else 'no detectado'}", 68, COLOR_BBOX_B)
 
 
 # ============================================================
@@ -477,10 +559,36 @@ def guardar_mapa_calor(calor_A, calor_B, ys_A, ys_B,
 
 
 # ============================================================
+# MÓDULO 7 — PREVIEW DE CANCHA EN TIEMPO REAL
+# ============================================================
+
+def render_cancha_preview(cancha_img, calor_A, calor_B, tray_A, tray_B):
+    """Genera imagen BGR con heatmap + trayectorias para cv2.imshow."""
+    preview = cancha_img.copy()
+
+    for calor, color_map in [(calor_A, cv2.COLORMAP_HOT),
+                             (calor_B, cv2.COLORMAP_WINTER)]:
+        if calor.max() > 0:
+            norm = cv2.normalize(calor, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            blur = cv2.GaussianBlur(norm, (51, 51), 0)
+            heat = cv2.applyColorMap(blur, color_map)
+            mask = blur > 15
+            preview[mask] = cv2.addWeighted(preview, 0.4, heat, 0.6, 0)[mask]
+
+    for tray, color in [(tray_A, (0, 0, 220)), (tray_B, (220, 80, 0))]:
+        for i in range(1, len(tray)):
+            if np.hypot(tray[i][0] - tray[i-1][0],
+                        tray[i][1] - tray[i-1][1]) < 60:
+                cv2.line(preview, tray[i-1], tray[i], color, 2)
+
+    return preview
+
+
+# ============================================================
 # PIPELINE PRINCIPAL
 # ============================================================
 
-def procesar_video(ruta_entrada, ruta_salida="video_procesado.mp4"):
+def procesar_video(ruta_entrada, ruta_salida="video_procesado.mp4", modo_test=False):
     cap = cv2.VideoCapture(ruta_entrada)
     if not cap.isOpened():
         print(f"ERROR: No se puede abrir '{ruta_entrada}'")
@@ -496,21 +604,30 @@ def procesar_video(ruta_entrada, ruta_salida="video_procesado.mp4"):
     alto_v, ancho_v = frame_t.shape[:2]
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-    fps_salida = fps_orig / FRAME_SKIP
+    # YOLO — cargar una vez antes del loop
+    net = _cargar_yolo()
 
-    # Máscara del polígono de la cancha (tamaño del frame original)
+    # Máscara de tracking (siempre necesaria)
     mascara_cancha = np.zeros((alto_v, ancho_v), dtype=np.uint8)
-    cv2.fillPoly(mascara_cancha, [CANCHA_PUNTOS], 255)
+    cv2.fillPoly(mascara_cancha, [ZONA_TRACKING], 255)
 
-    # Cargar cancha.png
+    # MOG2 — solo para pelota (objetos pequeños en movimiento)
+    sustractor = cv2.createBackgroundSubtractorMOG2(
+        history=MOG2_HISTORY,
+        varThreshold=MOG2_VAR_THRESHOLD,
+        detectShadows=False
+    )
+
+    # Cancha — necesaria en ambos modos (perspectiva + preview)
     cancha_path = Path("cancha.png")
     if cancha_path.exists():
-        img_cancha_rgb = cv2.cvtColor(cv2.imread(str(cancha_path)),
-                                      cv2.COLOR_BGR2RGB)
+        img_cancha_bgr = cv2.imread(str(cancha_path))
+        img_cancha_rgb = cv2.cvtColor(img_cancha_bgr, cv2.COLOR_BGR2RGB)
         print(f"  cancha.png: {img_cancha_rgb.shape[1]}×{img_cancha_rgb.shape[0]} px")
     else:
         print("  AVISO: cancha.png no encontrada — fondo genérico")
         img_cancha_rgb = np.full((900, 500, 3), 30, dtype=np.uint8)
+        img_cancha_bgr = img_cancha_rgb.copy()
     alto_c, ancho_c = img_cancha_rgb.shape[:2]
 
     M_perspectiva   = crear_transformacion(img_cancha_rgb)
@@ -518,45 +635,45 @@ def procesar_video(ruta_entrada, ruta_salida="video_procesado.mp4"):
     if rect_cancha_img:
         print(f"  Rect cancha en imagen: {rect_cancha_img}")
 
-    # MOG2 — se alimenta con TODOS los frames para mejor modelo del fondo
-    sustractor = cv2.createBackgroundSubtractorMOG2(
-        history=MOG2_HISTORY,
-        varThreshold=MOG2_VAR_THRESHOLD,
-        detectShadows=False
-    )
+    calor_A    = np.zeros((alto_c, ancho_c), dtype=np.float32)
+    calor_B    = np.zeros((alto_c, ancho_c), dtype=np.float32)
+    tray_A_all = []
+    tray_B_all = []
 
-    # Acumuladores en espacio de cancha.png
-    calor_A     = np.zeros((alto_c, ancho_c), dtype=np.float32)
-    calor_B     = np.zeros((alto_c, ancho_c), dtype=np.float32)
-    tray_A_all  = []
-    tray_B_all  = []
-    ys_A_cancha = []
-    ys_B_cancha = []
+    # Inicialización solo para modo normal
+    if not modo_test:
+        fps_salida  = fps_orig / FRAME_SKIP
+        ys_A_cancha = []
+        ys_B_cancha = []
 
-    cola_A      = deque(maxlen=COLA_JUGADORES)
-    cola_B      = deque(maxlen=COLA_JUGADORES)
-    cola_pelota = deque(maxlen=COLA_PELOTA)
+        cola_A      = deque(maxlen=COLA_JUGADORES)
+        cola_B      = deque(maxlen=COLA_JUGADORES)
+        cola_pelota = deque(maxlen=COLA_PELOTA)
 
-    ultima_A_p    = None;  frames_sin_A = 0
-    ultima_B_p    = None;  frames_sin_B = 0
+        ultima_pelota  = None
+        hist_pelota    = deque(maxlen=5)
+        ultimo_golpe_p = -(COOLDOWN_GOLPE + 1)
+        golpe_pos      = None
 
-    ultima_pelota  = None
-    hist_pelota    = deque(maxlen=5)
-    ultimo_golpe_p = -(COOLDOWN_GOLPE + 1)
-    golpe_pos      = None
+        writer       = None
+        fourcc       = cv2.VideoWriter_fourcc(*"mp4v")
+        golpes_count = 0
 
-    writer        = None
-    fourcc        = cv2.VideoWriter_fourcc(*"mp4v")
-    golpes_count  = 0
-    frames_cenital= 0
-    frames_A      = 0
-    frames_B      = 0
-    frame_num     = 0
-    procesados    = 0
+    ultima_A_p     = None;  frames_sin_A = 0
+    ultima_B_p     = None;  frames_sin_B = 0
+    frames_cenital = 0
+    frames_A       = 0
+    frames_B       = 0
+    frame_num      = 0
+    procesados     = 0
 
-    print(f"Video: {ancho_v}×{alto_v} @ {fps_orig:.1f} fps — {total} frames")
-    print(f"frame_skip={FRAME_SKIP}  area_jugador={JUGADOR_AREA_MIN}-{JUGADOR_AREA_MAX}")
-    print("Procesando... (presioná 'q' para cancelar)\n")
+    modo_str = " [MODO TEST]" if modo_test else ""
+    print(f"Video: {ancho_v}×{alto_v} @ {fps_orig:.1f} fps — {total} frames{modo_str}")
+    print(f"frame_skip={FRAME_SKIP}  yolo_conf={YOLO_CONF_THRESH}")
+    if modo_test:
+        print("Modo test: solo visualizacion. Cerrar con 'q'.\n")
+    else:
+        print("Procesando... (presioná 'q' para cancelar)\n")
 
     while True:
         ret, frame = cap.read()
@@ -564,107 +681,147 @@ def procesar_video(ruta_entrada, ruta_salida="video_procesado.mp4"):
             break
 
         frame_num += 1
-
-        # MOG2 recibe todos los frames para estabilizar el modelo del fondo
         mask_mog = sustractor.apply(frame)
 
         if frame_num % FRAME_SKIP != 0:
             continue
         procesados += 1
 
-        # Cenital check en frame a mitad de resolución
         pequeño     = cv2.resize(frame, (ancho_v // 2, alto_v // 2))
         pequeño_hsv = cv2.cvtColor(pequeño, cv2.COLOR_BGR2HSV)
         if not es_cenital(pequeño_hsv):
             continue
         frames_cenital += 1
 
-        # Módulo 1: jugadores
-        pos_A_raw, bbox_A, pos_B_raw, bbox_B = detectar_jugadores_mog2(
-            mask_mog, mascara_cancha
-        )
+        frame_yolo = cv2.resize(frame, (960, 540))
+        yolo_boxes = detectar_con_yolo(frame_yolo, net)
+        yolo_boxes = [(x1*2, y1*2, x2*2, y2*2, conf)
+                      for x1, y1, x2, y2, conf in yolo_boxes]
+        (torso_A_raw, zap_A_raw, bbox_A_raw, conf_A_raw,
+         torso_B_raw, zap_B_raw, bbox_B_raw, conf_B_raw) = separar_jugadores_yolo(yolo_boxes)
 
-        pos_A, ultima_A_p, frames_sin_A = filtrar_temporal(
-            pos_A_raw, ultima_A_p, frames_sin_A
-        )
-        pos_B, ultima_B_p, frames_sin_B = filtrar_temporal(
-            pos_B_raw, ultima_B_p, frames_sin_B
-        )
+        zap_A, ultima_A_p, frames_sin_A = filtrar_temporal(
+            zap_A_raw, ultima_A_p, frames_sin_A)
+        if zap_A is not None:
+            torso_A, bbox_A, conf_A = torso_A_raw, bbox_A_raw, conf_A_raw
+        else:
+            torso_A = bbox_A = conf_A = None
 
-        if pos_A is None:
-            bbox_A = None
-        if pos_B is None:
-            bbox_B = None
+        zap_B, ultima_B_p, frames_sin_B = filtrar_temporal(
+            zap_B_raw, ultima_B_p, frames_sin_B)
+        if zap_B is not None:
+            torso_B, bbox_B, conf_B = torso_B_raw, bbox_B_raw, conf_B_raw
+        else:
+            torso_B = bbox_B = conf_B = None
 
-        # Acumular posiciones en cancha.png con perspectiva correcta
-        def acumular(pos, calor, tray_all, ys_list):
-            if pos is None:
-                return 0
-            xi, yi = video_a_cancha(*pos, M_perspectiva)
-            xi = int(np.clip(xi, 0, ancho_c - 1))
-            yi = int(np.clip(yi, 0, alto_c - 1))
-            tray_all.append((xi, yi))
-            if rect_cancha_img is None or (
-                rect_cancha_img[0] <= xi < rect_cancha_img[0] + rect_cancha_img[2] and
-                rect_cancha_img[1] <= yi < rect_cancha_img[1] + rect_cancha_img[3]
-            ):
-                calor[yi, xi] += 1
-                ys_list.append(yi)
-            return 1
-
-        frames_A += acumular(pos_A, calor_A, tray_A_all, ys_A_cancha)
-        frames_B += acumular(pos_B, calor_B, tray_B_all, ys_B_cancha)
-
-        cola_A.append(pos_A)
-        cola_B.append(pos_B)
-
-        # Módulo 2: pelota
-        frame_hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        pelota    = detectar_pelota(frame_hsv, mascara_cancha, ultima_pelota)
-        if pelota:
-            ultima_pelota = pelota
-        hist_pelota.append(pelota)
-        cola_pelota.append(pelota)
-
-        # Golpes
-        if detectar_golpe(hist_pelota, ultimo_golpe_p, procesados):
-            golpes_count  += 1
-            ultimo_golpe_p = procesados
-            golpe_pos      = pelota or ultima_pelota
-
-        # ---- Dibujo ----
-        if writer is None:
-            writer = cv2.VideoWriter(ruta_salida, fourcc, fps_salida, (ancho_v, alto_v))
-
-        # Polígono de la cancha (verde, 1px)
+        # ---- Dibujo común ----
+        cv2.polylines(frame, [ZONA_TRACKING], isClosed=True,
+                      color=(0, 0, 200), thickness=1, lineType=cv2.LINE_AA)
         cv2.polylines(frame, [CANCHA_PUNTOS], isClosed=True,
                       color=COLOR_CANCHA, thickness=1, lineType=cv2.LINE_AA)
+        cv2.line(frame, RED_IZQ, RED_DER, (0, 140, 255), 2, cv2.LINE_AA)
 
-        dibujar_cola(frame, cola_A,      COLOR_A,      radio_max=4)
-        dibujar_cola(frame, cola_B,      COLOR_B,      radio_max=4)
-        dibujar_cola(frame, cola_pelota, COLOR_PELOTA, radio_max=3)
+        if modo_test:
+            # Acumular zapatillas en cancha para trayectorias y heatmap
+            for pos, calor, tray in [(zap_A, calor_A, tray_A_all),
+                                     (zap_B, calor_B, tray_B_all)]:
+                if pos is not None:
+                    xi, yi = video_a_cancha(*pos, M_perspectiva)
+                    xi = int(np.clip(xi, 0, ancho_c - 1))
+                    yi = int(np.clip(yi, 0, alto_c - 1))
+                    tray.append((xi, yi))
+                    calor[yi, xi] += 1
 
-        dibujar_jugador(frame, pos_A, bbox_A, COLOR_BBOX_A, "Jugador A")
-        dibujar_jugador(frame, pos_B, bbox_B, COLOR_BBOX_B, "Jugador B")
+            # Jugador A — bbox rosa + label conf + línea torso→zap + círculo blanco
+            if zap_A is not None and bbox_A is not None:
+                frames_A += 1
+                x1, y1, x2, y2 = bbox_A
+                cv2.rectangle(frame, (x1, y1), (x2, y2), COLOR_BBOX_A, 2)
+                cv2.putText(frame, f"A ({int(conf_A * 100)}%)",
+                            (x1, max(y1 - 6, 12)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_BBOX_A, 2, cv2.LINE_AA)
+                cv2.line(frame, torso_A, zap_A, COLOR_BBOX_A, 2, cv2.LINE_AA)
+                cv2.circle(frame, zap_A, 8, (255, 255, 255), -1)
+            # Jugador B — bbox celeste + label conf + línea torso→zap + círculo blanco
+            if zap_B is not None and bbox_B is not None:
+                frames_B += 1
+                x1, y1, x2, y2 = bbox_B
+                cv2.rectangle(frame, (x1, y1), (x2, y2), COLOR_BBOX_B, 2)
+                cv2.putText(frame, f"B ({int(conf_B * 100)}%)",
+                            (x1, max(y1 - 6, 12)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_BBOX_B, 2, cv2.LINE_AA)
+                cv2.line(frame, torso_B, zap_B, COLOR_BBOX_B, 2, cv2.LINE_AA)
+                cv2.circle(frame, zap_B, 8, (255, 255, 255), -1)
 
-        if pelota:
-            cv2.circle(frame, pelota, 9,  COLOR_PELOTA, -1)
-            cv2.circle(frame, pelota, 11, (0, 0, 0),    1)
+            if procesados % 30 == 0:
+                print(f"  Frame {frame_num:5d}  |  "
+                      f"A: {frames_A:4d} det / {frames_cenital - frames_A:4d} no det  |  "
+                      f"B: {frames_B:4d} det / {frames_cenital - frames_B:4d} no det")
+                cv2.imshow("Cancha", render_cancha_preview(
+                    img_cancha_bgr, calor_A, calor_B, tray_A_all, tray_B_all))
 
-        frames_desde_golpe = procesados - ultimo_golpe_p
-        if 0 < frames_desde_golpe <= 8 and golpe_pos and frames_desde_golpe % 2 == 1:
-            cv2.circle(frame, golpe_pos, 28, COLOR_GOLPE, 3)
-            cv2.putText(frame, "GOLPE", (golpe_pos[0] + 30, golpe_pos[1]),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, COLOR_GOLPE, 2, cv2.LINE_AA)
+        else:
+            # Acumular zapatillas en cancha.png con perspectiva correcta
+            def acumular(pos, calor, tray_all, ys_list):
+                if pos is None:
+                    return 0
+                xi, yi = video_a_cancha(*pos, M_perspectiva)
+                xi = int(np.clip(xi, 0, ancho_c - 1))
+                yi = int(np.clip(yi, 0, alto_c - 1))
+                tray_all.append((xi, yi))
+                if rect_cancha_img is None or (
+                    rect_cancha_img[0] <= xi < rect_cancha_img[0] + rect_cancha_img[2] and
+                    rect_cancha_img[1] <= yi < rect_cancha_img[1] + rect_cancha_img[3]
+                ):
+                    calor[yi, xi] += 1
+                    ys_list.append(yi)
+                return 1
 
-        dibujar_overlay(frame, frame_num, fps_orig, golpes_count, pos_A, pos_B)
+            frames_A += acumular(zap_A, calor_A, tray_A_all, ys_A_cancha)
+            frames_B += acumular(zap_B, calor_B, tray_B_all, ys_B_cancha)
 
-        if procesados % 50 == 0:
-            pct = 100 * frame_num // total
-            print(f"  Frame {frame_num}/{total} ({pct}%) — "
-                  f"cenital: {frames_cenital}  golpes: {golpes_count}")
+            cola_A.append(zap_A)
+            cola_B.append(zap_B)
 
-        writer.write(frame)
+            frame_hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            pelota    = detectar_pelota(frame_hsv, mascara_cancha, ultima_pelota, mask_mog)
+            if pelota:
+                ultima_pelota = pelota
+            hist_pelota.append(pelota)
+            cola_pelota.append(pelota)
+
+            if detectar_golpe(hist_pelota, ultimo_golpe_p, procesados):
+                golpes_count  += 1
+                ultimo_golpe_p = procesados
+                golpe_pos      = pelota or ultima_pelota
+
+            dibujar_cola(frame, cola_A,      COLOR_A,      radio_max=4)
+            dibujar_cola(frame, cola_B,      COLOR_B,      radio_max=4)
+            dibujar_cola(frame, cola_pelota, COLOR_PELOTA, radio_max=3)
+
+            dibujar_jugador(frame, torso_A, zap_A, COLOR_BBOX_A, "Jugador A")
+            dibujar_jugador(frame, torso_B, zap_B, COLOR_BBOX_B, "Jugador B")
+
+            if pelota:
+                cv2.circle(frame, pelota, 9,  COLOR_PELOTA, -1)
+                cv2.circle(frame, pelota, 11, (0, 0, 0),    1)
+
+            frames_desde_golpe = procesados - ultimo_golpe_p
+            if 0 < frames_desde_golpe <= 8 and golpe_pos and frames_desde_golpe % 2 == 1:
+                cv2.circle(frame, golpe_pos, 28, COLOR_GOLPE, 3)
+                cv2.putText(frame, "GOLPE", (golpe_pos[0] + 30, golpe_pos[1]),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.75, COLOR_GOLPE, 2, cv2.LINE_AA)
+
+            dibujar_overlay(frame, frame_num, fps_orig, golpes_count, torso_A, torso_B)
+
+            if procesados % 50 == 0:
+                pct = 100 * frame_num // total
+                print(f"  Frame {frame_num}/{total} ({pct}%) — "
+                      f"cenital: {frames_cenital}  golpes: {golpes_count}")
+
+            if writer is None:
+                writer = cv2.VideoWriter(ruta_salida, fourcc, fps_salida, (ancho_v, alto_v))
+            writer.write(frame)
 
         preview = cv2.resize(frame, (ancho_v // 2, alto_v // 2))
         cv2.imshow("Analisis Tenis", preview)
@@ -673,21 +830,21 @@ def procesar_video(ruta_entrada, ruta_salida="video_procesado.mp4"):
             break
 
     cap.release()
-    if writer:
+    if not modo_test and writer:
         writer.release()
     cv2.destroyAllWindows()
 
-    print()
-    print("=== RESUMEN DEL PARTIDO ===")
-    print(f"Frames con vista cenital: {frames_cenital} / {procesados} procesados")
-    print(f"Golpes detectados:         {golpes_count}")
-    print(f"Jugador A detectado:       {frames_A} frames")
-    print(f"Jugador B detectado:       {frames_B} frames")
-    print("===========================")
-
-    guardar_trayectorias(tray_A_all, tray_B_all, img_cancha_rgb, frames_A, frames_B)
-    guardar_mapa_calor(calor_A, calor_B, ys_A_cancha, ys_B_cancha,
-                       img_cancha_rgb, alto_c, rect_cancha_img)
+    if not modo_test:
+        print()
+        print("=== RESUMEN DEL PARTIDO ===")
+        print(f"Frames con vista cenital: {frames_cenital} / {procesados} procesados")
+        print(f"Golpes detectados:         {golpes_count}")
+        print(f"Jugador A detectado:       {frames_A} frames")
+        print(f"Jugador B detectado:       {frames_B} frames")
+        print("===========================")
+        guardar_trayectorias(tray_A_all, tray_B_all, img_cancha_rgb, frames_A, frames_B)
+        guardar_mapa_calor(calor_A, calor_B, ys_A_cancha, ys_B_cancha,
+                           img_cancha_rgb, alto_c, rect_cancha_img)
 
 
 # ============================================================
@@ -695,7 +852,10 @@ def procesar_video(ruta_entrada, ruta_salida="video_procesado.mp4"):
 # ============================================================
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Uso: python analisis_tenis.py <video.mp4>")
+    args = sys.argv[1:]
+    if not args or args[0].startswith("-"):
+        print("Uso: python analisis_tenis.py <video.mp4> [--test]")
         sys.exit(1)
-    procesar_video(sys.argv[1])
+    ruta   = args[0]
+    test   = "--test" in args
+    procesar_video(ruta, modo_test=test)
