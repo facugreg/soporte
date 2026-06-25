@@ -29,7 +29,7 @@ import urllib.request
 # CONFIGURACIÓN
 # ============================================================
 
-FRAME_SKIP = 4
+FRAME_SKIP = 5
 
 # Vista cenital
 HSV_CANCHA_BAJO = np.array([85,  40,  60])
@@ -46,10 +46,10 @@ ZONA_TRACKING = np.array([
 
 # Cancha exacta — solo para mapeo de perspectiva a cancha.png (trapecio verde)
 CANCHA_PUNTOS = np.array([
-    [684,  190],   # Superior izquierda
-    [1240, 200],   # Superior derecha
-    [1506, 840],   # Inferior derecha
-    [408,  828],   # Inferior izquierda
+    [684,  238],   # Superior izquierda
+    [1240, 248],   # Superior derecha
+    [1506, 764],   # Inferior derecha
+    [408,  752],   # Inferior izquierda
 ], dtype=np.int32)
 
 # Red — separa Jugador A (cercano) de Jugador B (lejano)
@@ -90,7 +90,7 @@ COLA_JUGADORES = 20
 COLA_PELOTA    = 15
 
 # Imagen final
-TRAY_MAX_SALTO = 60
+TRAY_MAX_SALTO = 120
 
 # Colores BGR
 COLOR_A      = (0,   0,  220)
@@ -309,48 +309,36 @@ def detectar_golpe(hist_pelota, ultimo_golpe_p, proc_actual):
 # MÓDULO 3 — TRANSFORMACIÓN DE PERSPECTIVA
 # ============================================================
 
-def _leer_puntos_calibracion(ruta="calibracion.txt"):
-    """
-    Parsea calibracion.txt (generado por calibrar.py) y retorna los 4 primeros
-    puntos como np.float32, o None si el archivo no existe o está incompleto.
-    """
-    try:
-        with open(ruta, encoding="utf-8") as f:
-            contenido = f.read()
-        pts = []
-        for linea in contenido.splitlines():
-            linea = linea.strip()
-            if linea.startswith("[") and linea.endswith("],"):
-                nums = linea.strip("[],").split(",")
-                if len(nums) == 2:
-                    pts.append([int(nums[0].strip()), int(nums[1].strip())])
-        if len(pts) >= 4:
-            print(f"  Calibracion leida desde {ruta}: {len(pts)} puntos")
-            return np.float32(pts[:4])
-    except Exception:
-        pass
-    return None
 
-
-def crear_transformacion(img_cancha_rgb):
-    """
-    Calcula la homografía: 4 vértices del trapecio en el video
-    → zona de juego en cancha.png (portrait, red al 50% vertical).
-    Lee pts_video de calibracion.txt si existe; si no, usa CANCHA_PUNTOS.
-    """
+def crear_transformacion(img_cancha_rgb, rect_cancha_img=None):
     H, W = img_cancha_rgb.shape[:2]
 
-    pts_video = _leer_puntos_calibracion()
-    if pts_video is None:
-        pts_video = np.float32(CANCHA_PUNTOS[:4])
-        print("  Usando CANCHA_PUNTOS hardcodeados para la transformacion.")
+    if rect_cancha_img is not None:
+        rx, ry, rw, rh = rect_cancha_img
+        top    = ry
+        bottom = ry + rh
+        left   = rx
+        right  = rx + rw
+    else:
+        top, bottom = int(H * 0.05), int(H * 0.95)
+        left, right = int(W * 0.05), int(W * 0.95)
+
+    # ORDEN: sup-izq, sup-der, inf-der, inf-izq
+    pts_video = np.float32([
+        [684,  238],   # sup-izq → Nadal, fondo lejano izquierda
+        [1240, 248],   # sup-der → Nadal, fondo lejano derecha
+        [1506, 764],   # inf-der → Djokovic, fondo cercano derecha
+        [408,  752],   # inf-izq → Djokovic, fondo cercano izquierda
+    ])
 
     pts_cancha = np.float32([
-        [W * 0.20, H * 0.03],   # sup-izq → fondo lejano izq (Jugador B)
-        [W * 0.80, H * 0.03],   # sup-der → fondo lejano der
-        [W * 0.80, H * 0.97],   # inf-der → fondo cercano der (Jugador A)
-        [W * 0.20, H * 0.97],   # inf-izq → fondo cercano izq
+        [left,  top],      # Nadal fondo lejano izq → arriba-izq
+        [right, top],      # Nadal fondo lejano der → arriba-der
+        [right, bottom],   # Djokovic fondo cercano der → abajo-der
+        [left,  bottom],   # Djokovic fondo cercano izq → abajo-izq
     ])
+
+    print(f"  pts_cancha: top={top} bottom={bottom} left={left} right={right}")
     return cv2.getPerspectiveTransform(pts_video, pts_cancha)
 
 
@@ -584,6 +572,13 @@ def render_cancha_preview(cancha_img, calor_A, calor_B, tray_A, tray_B):
     return preview
 
 
+def dibujar_minimap(cancha_img, calor_A, calor_B, tray_A, tray_B):
+    """Minimap landscape (420×280) con heatmap y trayectorias para overlay en el video."""
+    mini_w, mini_h = 420, 280
+    preview = render_cancha_preview(cancha_img, calor_A, calor_B, tray_A, tray_B)
+    return cv2.resize(preview, (mini_w, mini_h))
+
+
 # ============================================================
 # PIPELINE PRINCIPAL
 # ============================================================
@@ -630,10 +625,10 @@ def procesar_video(ruta_entrada, ruta_salida="video_procesado.mp4", modo_test=Fa
         img_cancha_bgr = img_cancha_rgb.copy()
     alto_c, ancho_c = img_cancha_rgb.shape[:2]
 
-    M_perspectiva   = crear_transformacion(img_cancha_rgb)
     rect_cancha_img = detectar_rect_cancha_imagen(img_cancha_rgb)
     if rect_cancha_img:
         print(f"  Rect cancha en imagen: {rect_cancha_img}")
+    M_perspectiva   = crear_transformacion(img_cancha_rgb, rect_cancha_img)
 
     calor_A    = np.zeros((alto_c, ancho_c), dtype=np.float32)
     calor_B    = np.zeros((alto_c, ancho_c), dtype=np.float32)
@@ -643,8 +638,6 @@ def procesar_video(ruta_entrada, ruta_salida="video_procesado.mp4", modo_test=Fa
     # Inicialización solo para modo normal
     if not modo_test:
         fps_salida  = fps_orig / FRAME_SKIP
-        ys_A_cancha = []
-        ys_B_cancha = []
 
         cola_A      = deque(maxlen=COLA_JUGADORES)
         cola_B      = deque(maxlen=COLA_JUGADORES)
@@ -693,9 +686,11 @@ def procesar_video(ruta_entrada, ruta_salida="video_procesado.mp4", modo_test=Fa
             continue
         frames_cenital += 1
 
-        frame_yolo = cv2.resize(frame, (960, 540))
+        frame_yolo = cv2.resize(frame, (640, 360))
         yolo_boxes = detectar_con_yolo(frame_yolo, net)
-        yolo_boxes = [(x1*2, y1*2, x2*2, y2*2, conf)
+        scale_x = frame.shape[1] / 640
+        scale_y = frame.shape[0] / 360
+        yolo_boxes = [(int(x1*scale_x), int(y1*scale_y), int(x2*scale_x), int(y2*scale_y), conf)
                       for x1, y1, x2, y2, conf in yolo_boxes]
         (torso_A_raw, zap_A_raw, bbox_A_raw, conf_A_raw,
          torso_B_raw, zap_B_raw, bbox_B_raw, conf_B_raw) = separar_jugadores_yolo(yolo_boxes)
@@ -726,11 +721,21 @@ def procesar_video(ruta_entrada, ruta_salida="video_procesado.mp4", modo_test=Fa
             for pos, calor, tray in [(zap_A, calor_A, tray_A_all),
                                      (zap_B, calor_B, tray_B_all)]:
                 if pos is not None:
+                    if cv2.pointPolygonTest(ZONA_TRACKING, (float(pos[0]), float(pos[1])), False) < 0:
+                        continue
                     xi, yi = video_a_cancha(*pos, M_perspectiva)
                     xi = int(np.clip(xi, 0, ancho_c - 1))
                     yi = int(np.clip(yi, 0, alto_c - 1))
                     tray.append((xi, yi))
                     calor[yi, xi] += 1
+
+            if procesados % 60 == 0:
+                if zap_A:
+                    xi, yi = video_a_cancha(*zap_A, M_perspectiva)
+                    print(f"  Zap A video={zap_A} → cancha=({xi},{yi})  cancha size={ancho_c}x{alto_c}")
+                if zap_B:
+                    xi, yi = video_a_cancha(*zap_B, M_perspectiva)
+                    print(f"  Zap B video={zap_B} → cancha=({xi},{yi})  cancha size={ancho_c}x{alto_c}")
 
             # Jugador A — bbox rosa + label conf + línea torso→zap + círculo blanco
             if zap_A is not None and bbox_A is not None:
@@ -757,28 +762,31 @@ def procesar_video(ruta_entrada, ruta_salida="video_procesado.mp4", modo_test=Fa
                 print(f"  Frame {frame_num:5d}  |  "
                       f"A: {frames_A:4d} det / {frames_cenital - frames_A:4d} no det  |  "
                       f"B: {frames_B:4d} det / {frames_cenital - frames_B:4d} no det")
-                cv2.imshow("Cancha", render_cancha_preview(
-                    img_cancha_bgr, calor_A, calor_B, tray_A_all, tray_B_all))
 
         else:
             # Acumular zapatillas en cancha.png con perspectiva correcta
-            def acumular(pos, calor, tray_all, ys_list):
+            def acumular(pos, calor, tray_all):
                 if pos is None:
+                    return 0
+                if cv2.pointPolygonTest(ZONA_TRACKING, (float(pos[0]), float(pos[1])), False) < 0:
                     return 0
                 xi, yi = video_a_cancha(*pos, M_perspectiva)
                 xi = int(np.clip(xi, 0, ancho_c - 1))
                 yi = int(np.clip(yi, 0, alto_c - 1))
                 tray_all.append((xi, yi))
-                if rect_cancha_img is None or (
-                    rect_cancha_img[0] <= xi < rect_cancha_img[0] + rect_cancha_img[2] and
-                    rect_cancha_img[1] <= yi < rect_cancha_img[1] + rect_cancha_img[3]
-                ):
-                    calor[yi, xi] += 1
-                    ys_list.append(yi)
+                calor[yi, xi] += 1
                 return 1
 
-            frames_A += acumular(zap_A, calor_A, tray_A_all, ys_A_cancha)
-            frames_B += acumular(zap_B, calor_B, tray_B_all, ys_B_cancha)
+            frames_A += acumular(zap_A, calor_A, tray_A_all)
+            frames_B += acumular(zap_B, calor_B, tray_B_all)
+
+            if procesados % 60 == 0:
+                if zap_A:
+                    xi, yi = video_a_cancha(*zap_A, M_perspectiva)
+                    print(f"  Zap A video={zap_A} → cancha=({xi},{yi})  cancha size={ancho_c}x{alto_c}")
+                if zap_B:
+                    xi, yi = video_a_cancha(*zap_B, M_perspectiva)
+                    print(f"  Zap B video={zap_B} → cancha=({xi},{yi})  cancha size={ancho_c}x{alto_c}")
 
             cola_A.append(zap_A)
             cola_B.append(zap_B)
@@ -823,7 +831,7 @@ def procesar_video(ruta_entrada, ruta_salida="video_procesado.mp4", modo_test=Fa
                 writer = cv2.VideoWriter(ruta_salida, fourcc, fps_salida, (ancho_v, alto_v))
             writer.write(frame)
 
-        preview = cv2.resize(frame, (ancho_v // 2, alto_v // 2))
+        preview = cv2.resize(frame, (ancho_v // 3, alto_v // 3))
         cv2.imshow("Analisis Tenis", preview)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             print("  Cancelado por el usuario.")
@@ -832,6 +840,10 @@ def procesar_video(ruta_entrada, ruta_salida="video_procesado.mp4", modo_test=Fa
     cap.release()
     if not modo_test and writer:
         writer.release()
+
+    preview_final = render_cancha_preview(img_cancha_bgr, calor_A, calor_B, tray_A_all, tray_B_all)
+    cv2.imshow("Cancha - Resultado Final", preview_final)
+    cv2.waitKey(0)
     cv2.destroyAllWindows()
 
     if not modo_test:
@@ -842,9 +854,10 @@ def procesar_video(ruta_entrada, ruta_salida="video_procesado.mp4", modo_test=Fa
         print(f"Jugador A detectado:       {frames_A} frames")
         print(f"Jugador B detectado:       {frames_B} frames")
         print("===========================")
-        guardar_trayectorias(tray_A_all, tray_B_all, img_cancha_rgb, frames_A, frames_B)
-        guardar_mapa_calor(calor_A, calor_B, ys_A_cancha, ys_B_cancha,
-                           img_cancha_rgb, alto_c, rect_cancha_img)
+
+    guardar_trayectorias(tray_A_all, tray_B_all, img_cancha_rgb, frames_A, frames_B)
+    guardar_mapa_calor(calor_A, calor_B, [], [],
+                       img_cancha_rgb, alto_c, rect_cancha_img)
 
 
 # ============================================================
