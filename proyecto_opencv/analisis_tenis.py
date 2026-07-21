@@ -29,7 +29,7 @@ import urllib.request
 # CONFIGURACIÓN
 # ============================================================
 
-FRAME_SKIP = 5
+FRAME_SKIP = 8
 
 # Vista cenital
 HSV_CANCHA_BAJO = np.array([85,  40,  60])
@@ -46,10 +46,10 @@ ZONA_TRACKING = np.array([
 
 # Cancha exacta — solo para mapeo de perspectiva a cancha.png (trapecio verde)
 CANCHA_PUNTOS = np.array([
-    [684,  238],   # Superior izquierda
-    [1240, 248],   # Superior derecha
-    [1506, 764],   # Inferior derecha
-    [408,  752],   # Inferior izquierda
+    [684,  250],   # Superior izquierda
+    [1240, 270],   # Superior derecha
+    [1506, 820],   # Inferior derecha
+    [408,  808],   # Inferior izquierda
 ], dtype=np.int32)
 
 # Red — separa Jugador A (cercano) de Jugador B (lejano)
@@ -686,10 +686,10 @@ def procesar_video(ruta_entrada, ruta_salida="video_procesado.mp4", modo_test=Fa
             continue
         frames_cenital += 1
 
-        frame_yolo = cv2.resize(frame, (640, 360))
+        frame_yolo = cv2.resize(frame, (320, 180))
         yolo_boxes = detectar_con_yolo(frame_yolo, net)
-        scale_x = frame.shape[1] / 640
-        scale_y = frame.shape[0] / 360
+        scale_x = frame.shape[1] / 320
+        scale_y = frame.shape[0] / 180
         yolo_boxes = [(int(x1*scale_x), int(y1*scale_y), int(x2*scale_x), int(y2*scale_y), conf)
                       for x1, y1, x2, y2, conf in yolo_boxes]
         (torso_A_raw, zap_A_raw, bbox_A_raw, conf_A_raw,
@@ -840,11 +840,6 @@ def procesar_video(ruta_entrada, ruta_salida="video_procesado.mp4", modo_test=Fa
     cap.release()
     if not modo_test and writer:
         writer.release()
-
-    preview_final = render_cancha_preview(img_cancha_bgr, calor_A, calor_B, tray_A_all, tray_B_all)
-    cv2.imshow("Cancha - Resultado Final", preview_final)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
 
     if not modo_test:
         print()

@@ -1,0 +1,20 @@
+
+Tarea 1 datos sql server y muestren un cuenta corriente ,
+ me armas un base datos sql server 
+ con tabla clientes con numero cliente , nombre , cuit .
+  otra tabla cuenta corriente con campos fecha , nrocomprobante , detalle  , debe , haber 
+  ambas con datos 10 cliente 
+  y otra tabla con 6 movimientos de por cliente 
+  con datos intercaldas de 1 factura y 1 recibo que la cancela con el mismo importe 
+
+Tarea 2 hacer un codigo python con streamlit que muestre para selecionar el cliente y muestre su cuenta corriente 
+con los datos de la base de datos sql server creada en la tarea 1 
+
+Tarea 3 agregar al fomulario un boton para sacar los datos de cuenta corriente 
+ en pdf y/o en excel  y guardar los achivos en una carpeta 
+
+
+Tarea 4 agregar un boton que llame a un reporte que pase los datos a pandas que muestre 
+grafico con la en eje x mes del año y eje y  cantidad mensual facturad
+
+

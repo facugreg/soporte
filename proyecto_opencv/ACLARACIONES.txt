@@ -1,0 +1,24 @@
+# Análisis deportivo de tenis con OpenCV
+
+## Requisitos del video para que el programa funcione correctamente
+
+### Cámara
+- Vista lateral fija desde las gradas, aproximadamente al nivel de la red
+- La cámara NO se mueve ni hace zoom durante el rally
+- Se ven las dos líneas de fondo de la cancha completas
+
+### Resolución y formato
+- 1920x1080 (Full HD) recomendado
+- Mínimo 25 fps
+- Formato MP4
+
+### Tipo de cancha
+- Hard court azul o verde oscuro (US Open, Australian Open, etc.)
+- NO funciona bien con tierra batida (naranja) ni pasto
+
+### Jugadores
+- Los dos jugadores deben tener remeras de colores distintos entre sí
+- Buena iluminación, sin contraluz
+
+### Cómo ejecutar
+    python analisis_tenis.py nombre_del_video.mp4
