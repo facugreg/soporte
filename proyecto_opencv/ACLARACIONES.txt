@@ -1,24 +1,30 @@
-# Análisis deportivo de tenis con OpenCV
+# Sistema de análisis deportivo de tenis con OpenCV y YOLO
 
-## Requisitos del video para que el programa funcione correctamente
+## ¿Qué hace el programa?
 
-### Cámara
-- Vista lateral fija desde las gradas, aproximadamente al nivel de la red
-- La cámara NO se mueve ni hace zoom durante el rally
-- Se ven las dos líneas de fondo de la cancha completas
+Analiza videos de partidos de tenis profesional detectando y trackeando
+a los dos jugadores automáticamente con YOLOv8. Genera una imagen de
+análisis con trayectorias y mapa de calor de cada jugador.
 
-### Resolución y formato
-- 1920x1080 (Full HD) recomendado
-- Mínimo 25 fps
-- Formato MP4
+## Salida
 
-### Tipo de cancha
-- Hard court azul o verde oscuro (US Open, Australian Open, etc.)
-- NO funciona bien con tierra batida (naranja) ni pasto
+resumen.png — imagen con dos paneles:
+  - Izquierdo: trayectoria completa de cada jugador sobre la cancha
+  - Derecho: mapa de calor de presencia de cada jugador
 
-### Jugadores
-- Los dos jugadores deben tener remeras de colores distintos entre sí
-- Buena iluminación, sin contraluz
+## Cómo ejecutar
 
-### Cómo ejecutar
     python analisis_tenis.py nombre_del_video.mp4
+
+## Archivos necesarios
+
+- analisis_tenis.py   → código principal
+- yolov8n.onnx        → modelo de detección de jugadores
+- cancha.png          → imagen de referencia de la cancha
+
+## Requisitos del video
+
+- Cámara lateral fija desde las gradas, cancha completa visible
+- Resolución 1920x1080, mínimo 25fps, formato MP4
+- Hard court azul o verde (US Open, Australian Open)
+- Jugadores con remeras de colores distintos entre sí

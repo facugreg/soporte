@@ -8,7 +8,6 @@ Uso:
     python analisis_tenis.py video.mp4
 
 Salida:
-    - video_procesado.mp4
     - trayectorias.png
     - mapa_calor.png
 
@@ -506,18 +505,12 @@ def guardar_mapa_calor(calor_A, calor_B, ys_A, ys_B,
     ax.set_xlim(0, ancho_ci)
     ax.set_ylim(alto_ci, 0)
 
-    if rect_cancha_img is not None:
-        rx, ry, rw, rh = rect_cancha_img
-        extent = [rx, rx + rw, ry + rh, ry]
-        def preparar(acc):
-            h = blur_norm(acc)
-            if h is None:
-                return None
-            return to_disp(h[ry:ry + rh, rx:rx + rw])
-    else:
-        extent = None
-        def preparar(acc):
-            return to_disp(blur_norm(acc))
+    # Mostrar heatmap en toda la imagen, sin limitar al rect de la cancha
+    def preparar(acc):
+        h = blur_norm(acc)
+        if h is None:
+            return None
+        return to_disp(h)
 
     for acc, cmap_name in [(calor_A, "Reds"), (calor_B, "Blues")]:
         heat = preparar(acc)
@@ -525,12 +518,9 @@ def guardar_mapa_calor(calor_A, calor_B, ys_A, ys_B,
             continue
         cmap = plt.colormaps[cmap_name].copy()
         cmap.set_bad(alpha=0.0)
-        kw = dict(cmap=cmap, alpha=0.65, vmin=0, vmax=1,
-                  zorder=2, origin="upper")
-        if extent is not None:
-            ax.imshow(heat, extent=extent, **kw)
-        else:
-            ax.imshow(heat, **kw)
+        ax.imshow(heat, cmap=cmap, alpha=0.65, vmin=0, vmax=1,
+                  zorder=2, origin="upper",
+                  extent=[0, ancho_ci, alto_ci, 0])
 
     ax.set_title("Mapa de calor de posición",
                  color="white", fontsize=13, fontweight="bold", pad=10)
@@ -542,6 +532,84 @@ def guardar_mapa_calor(calor_A, calor_B, ys_A, ys_B,
     plt.tight_layout()
     plt.savefig(ruta, dpi=150, bbox_inches="tight",
                 facecolor=fig.get_facecolor())
+    plt.close()
+    print(f"  Guardado: {ruta}")
+
+
+def guardar_resumen_combinado(tray_A, tray_B, calor_A, calor_B,
+                               img_cancha_rgb, frames_A, frames_B,
+                               alto_c, rect_cancha_img=None,
+                               ruta="resumen.png"):
+    alto_ci, ancho_ci = img_cancha_rgb.shape[:2]
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6 * alto_ci / ancho_ci))
+    fig.patch.set_facecolor("#0d1b2a")
+
+    # ---- Panel izquierdo: Trayectorias ----
+    ax1.imshow(img_cancha_rgb, zorder=1)
+    ax1.set_xlim(0, ancho_ci)
+    ax1.set_ylim(alto_ci, 0)
+    ax1.set_title("Trayectorias", color="white", fontsize=11, fontweight="bold", pad=8)
+    ax1.axis("off")
+
+    for tray, rgb, etiqueta in [
+        (tray_A, (0.85, 0.1, 0.1), f"Jugador A ({frames_A} frames)"),
+        (tray_B, (0.1,  0.3, 0.95), f"Jugador B ({frames_B} frames)"),
+    ]:
+        if len(tray) < 2:
+            continue
+        n = len(tray)
+        for i in range(1, n):
+            dist = np.hypot(tray[i][0]-tray[i-1][0], tray[i][1]-tray[i-1][1])
+            if dist > TRAY_MAX_SALTO:
+                continue
+            t = i / n
+            color_seg = (rgb[0]*t, rgb[1]*t + 0.1*(1-t), rgb[2]*t + 0.2*(1-t))
+            ax1.plot([tray[i-1][0], tray[i][0]], [tray[i-1][1], tray[i][1]],
+                     color=color_seg, linewidth=1.0 + t*1.5,
+                     alpha=0.75, solid_capstyle="round", zorder=3)
+        ax1.scatter(tray[0][0],  tray[0][1],  s=60, color="white",
+                    edgecolors=rgb, linewidths=1.5, zorder=5, label=f"{etiqueta} — inicio")
+        ax1.scatter(tray[-1][0], tray[-1][1], s=80, color=rgb,
+                    edgecolors="white", linewidths=1.5, zorder=5, label=f"{etiqueta} — fin")
+    ax1.legend(loc="lower center", bbox_to_anchor=(0.5, -0.08),
+               ncol=2, fontsize=7, frameon=True,
+               facecolor="#0d1b2a", edgecolor="white", labelcolor="white")
+
+    # ---- Panel derecho: Mapa de calor ----
+    ax2.imshow(img_cancha_rgb, zorder=1)
+    ax2.set_xlim(0, ancho_ci)
+    ax2.set_ylim(alto_ci, 0)
+    ax2.set_title("Mapa de calor", color="white", fontsize=11, fontweight="bold", pad=8)
+    ax2.axis("off")
+
+    def blur_norm(acc):
+        if acc.max() == 0:
+            return None
+        b = cv2.GaussianBlur(acc, (81, 81), 0)
+        return b / b.max()
+
+    def to_disp(arr):
+        if arr is None:
+            return None
+        d = arr.astype(float)
+        d[d < 0.02] = np.nan
+        return d
+
+    for acc, cmap_name in [(calor_A, "Reds"), (calor_B, "Blues")]:
+        heat = to_disp(blur_norm(acc))
+        if heat is None:
+            continue
+        cmap = plt.colormaps[cmap_name].copy()
+        cmap.set_bad(alpha=0.0)
+        ax2.imshow(heat, cmap=cmap, alpha=0.65, vmin=0, vmax=1,
+                   zorder=2, origin="upper", extent=[0, ancho_ci, alto_ci, 0])
+
+    # ---- Título general ----
+    fig.suptitle("Análisis del partido — OpenCV + YOLOv8",
+                 color="white", fontsize=13, fontweight="bold", y=1.01)
+
+    plt.tight_layout()
+    plt.savefig(ruta, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close()
     print(f"  Guardado: {ruta}")
 
@@ -583,7 +651,7 @@ def dibujar_minimap(cancha_img, calor_A, calor_B, tray_A, tray_B):
 # PIPELINE PRINCIPAL
 # ============================================================
 
-def procesar_video(ruta_entrada, ruta_salida="video_procesado.mp4", modo_test=False):
+def procesar_video(ruta_entrada, modo_test=False):
     cap = cv2.VideoCapture(ruta_entrada)
     if not cap.isOpened():
         print(f"ERROR: No se puede abrir '{ruta_entrada}'")
@@ -637,8 +705,6 @@ def procesar_video(ruta_entrada, ruta_salida="video_procesado.mp4", modo_test=Fa
 
     # Inicialización solo para modo normal
     if not modo_test:
-        fps_salida  = fps_orig / FRAME_SKIP
-
         cola_A      = deque(maxlen=COLA_JUGADORES)
         cola_B      = deque(maxlen=COLA_JUGADORES)
         cola_pelota = deque(maxlen=COLA_PELOTA)
@@ -648,8 +714,6 @@ def procesar_video(ruta_entrada, ruta_salida="video_procesado.mp4", modo_test=Fa
         ultimo_golpe_p = -(COOLDOWN_GOLPE + 1)
         golpe_pos      = None
 
-        writer       = None
-        fourcc       = cv2.VideoWriter_fourcc(*"mp4v")
         golpes_count = 0
 
     ultima_A_p     = None;  frames_sin_A = 0
@@ -827,10 +891,6 @@ def procesar_video(ruta_entrada, ruta_salida="video_procesado.mp4", modo_test=Fa
                 print(f"  Frame {frame_num}/{total} ({pct}%) — "
                       f"cenital: {frames_cenital}  golpes: {golpes_count}")
 
-            if writer is None:
-                writer = cv2.VideoWriter(ruta_salida, fourcc, fps_salida, (ancho_v, alto_v))
-            writer.write(frame)
-
         preview = cv2.resize(frame, (ancho_v // 3, alto_v // 3))
         cv2.imshow("Analisis Tenis", preview)
         if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -838,8 +898,6 @@ def procesar_video(ruta_entrada, ruta_salida="video_procesado.mp4", modo_test=Fa
             break
 
     cap.release()
-    if not modo_test and writer:
-        writer.release()
 
     if not modo_test:
         print()
@@ -850,9 +908,9 @@ def procesar_video(ruta_entrada, ruta_salida="video_procesado.mp4", modo_test=Fa
         print(f"Jugador B detectado:       {frames_B} frames")
         print("===========================")
 
-    guardar_trayectorias(tray_A_all, tray_B_all, img_cancha_rgb, frames_A, frames_B)
-    guardar_mapa_calor(calor_A, calor_B, [], [],
-                       img_cancha_rgb, alto_c, rect_cancha_img)
+    guardar_resumen_combinado(tray_A_all, tray_B_all, calor_A, calor_B,
+                              img_cancha_rgb, frames_A, frames_B,
+                              alto_c, rect_cancha_img)
 
 
 # ============================================================
