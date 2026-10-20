@@ -1,249 +1,227 @@
 import cv2
 import numpy as np
-from cv2 import aruco
-import os
+import threading
+import time
+from kivy.app import App
+from kivy.uix.image import Image as KivyImage
+from kivy.clock import Clock
+from kivy.graphics.texture import Texture
 
+MARKER_SIZE_CM = 5.0
+ALPHA = 0.95    # opacidad del cubo (0=invisible, 1=sólido). Subido respecto
+                # al original porque un Rubik's cube es plástico opaco, no
+                # tiene sentido que se "transparente" como el bloque de tierra.
 
-MARKER_SIZE = 0.05  # Tamano del marcador ArUco en metros (5 cm)
+_S = MARKER_SIZE_CM
+_H = _S / 2
 
-CALIB_FILE = "calibracion.npz"
+# Las 4 esquinas del marcador ArUco en coordenadas 3D reales (en cm, Z=0 = plano del papel).
+# Orden: TL, TR, BR, BL — mismo orden que devuelve el detector.
+MARKER_OBJ_PTS = np.float32([
+    [-_H,  _H, 0], [_H,  _H, 0], [_H, -_H, 0], [-_H, -_H, 0],
+])
 
-# Tablero de ajedrez usado para calibrar: cantidad de ESQUINAS
-# INTERNAS (no de casilleros). Un tablero de 10x7 casilleros
-# tiene 9x6 esquinas internas.
-CHESSBOARD_SIZE = (9, 6)
-SQUARE_SIZE = 0.025      # Lado real de cada casillero, en metros (2.5 cm)
-MIN_CALIB_SHOTS = 15     # Cantidad minima de capturas para calibrar bien
+# 8 vértices del cubo: 4 en la base (Z=0, apoyados en el marcador) y 4 en el techo (Z=_S).
+CUBE_VERTS = np.float32([
+    [-_H, -_H,  0], [_H, -_H,  0], [_H,  _H,  0], [-_H,  _H,  0],  # base
+    [-_H, -_H, _S], [_H, -_H, _S], [_H,  _H, _S], [-_H,  _H, _S],  # techo
+])
 
-# ---------- Puntos 3D del marcador (plano, Z=0) ----------
-marker_3d_points = np.array([
-    [-MARKER_SIZE/2,  MARKER_SIZE/2, 0],
-    [ MARKER_SIZE/2,  MARKER_SIZE/2, 0],
-    [ MARKER_SIZE/2, -MARKER_SIZE/2, 0],
-    [-MARKER_SIZE/2, -MARKER_SIZE/2, 0]
-], dtype=np.float32)
-
-# ---------- Los 8 vertices del cubo ----------
-# Primeros 4: base (apoyada sobre el marcador, Z=0)
-# Ultimos 4: techo (Z = MARKER_SIZE)
-cube_3d_points = np.array([
-    [-MARKER_SIZE/2, -MARKER_SIZE/2, 0],
-    [ MARKER_SIZE/2, -MARKER_SIZE/2, 0],
-    [ MARKER_SIZE/2,  MARKER_SIZE/2, 0],
-    [-MARKER_SIZE/2,  MARKER_SIZE/2, 0],
-    [-MARKER_SIZE/2, -MARKER_SIZE/2, MARKER_SIZE],
-    [ MARKER_SIZE/2, -MARKER_SIZE/2, MARKER_SIZE],
-    [ MARKER_SIZE/2,  MARKER_SIZE/2, MARKER_SIZE],
-    [-MARKER_SIZE/2,  MARKER_SIZE/2, MARKER_SIZE]
-], dtype=np.float32)
-
-# Las 6 caras del cubo: cada una definida por 4 indices (en orden,
-# recorriendo el contorno del cuadrado) + un color base en BGR.
-CUBE_FACES = [
-    ([0, 1, 2, 3], (50, 50, 200)),    # base    - rojo oscuro
-    ([4, 5, 6, 7], (60, 200, 60)),    # techo   - verde
-    ([0, 1, 5, 4], (200, 140, 40)),   # frente  - azul
-    ([1, 2, 6, 5], (40, 170, 220)),   # derecha - naranja
-    ([2, 3, 7, 6], (180, 60, 200)),   # atras   - violeta
-    ([3, 0, 4, 7], (200, 200, 40)),   # izquierda - celeste/amarillo
+# Cada cara: lista de índices en CUBE_VERTS + nombre de textura.
+# CAMBIO CLAVE respecto al original: antes 4 caras compartían la misma
+# textura 'side' (todas iguales, como un bloque de tierra). Un Rubik's
+# cube tiene sus 6 caras de colores DISTINTOS, así que ahora cada una
+# tiene su propio nombre único: top, bottom, front, back, left, right.
+FACES = [
+    ([4, 5, 6, 7], 'top'),
+    ([0, 1, 2, 3], 'bottom'),
+    ([4, 5, 1, 0], 'front'),
+    ([5, 6, 2, 1], 'right'),
+    ([6, 7, 3, 2], 'back'),
+    ([7, 4, 0, 3], 'left'),
 ]
 
 
-def calibrar_camara():
+def make_textures(size=90):
     """
-    Calibra la camara real usando un patron de tablero de ajedrez.
-    Muestra la camara en vivo; cuando detecta el tablero lo marca en
-    pantalla, y el usuario presiona 'c' para guardar esa captura.
-    Con varias capturas desde angulos distintos, cv2.calibrateCamera
-    calcula la matriz de camara (focal real, centro optico real) y
-    los coeficientes de distorsion reales del lente, en vez de los
-    valores estimados que se usaban en la version anterior.
+    Genera una textura de 3x3 "stickers" por cada cara del cubo, imitando
+    un Rubik's cube real: fondo negro (el plástico del cubo) con 9 cuadrados
+    de color separados por una grilla, igual que las etiquetas pegadas en
+    un cubo físico.
+
+    Usa el esquema de colores clásico (orientación occidental BOY):
+    blanco arriba, amarillo abajo, rojo-naranja opuestos, azul-verde opuestos.
+    Los colores están en BGR porque así los usa OpenCV, no RGB.
     """
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("Error: no se pudo abrir la camara para calibrar.")
-        exit(1)
+    rng = np.random.default_rng(7)
 
-    # Puntos 3D del tablero en su propio sistema de referencia (Z=0).
-    # mgrid arma la grilla de coordenadas (0,0), (1,0), (2,0)... y
-    # luego se escala por el tamano real de cada casillero.
-    objp = np.zeros((CHESSBOARD_SIZE[0] * CHESSBOARD_SIZE[1], 3), np.float32)
-    objp[:, :2] = np.mgrid[0:CHESSBOARD_SIZE[0], 0:CHESSBOARD_SIZE[1]].T.reshape(-1, 2)
-    objp *= SQUARE_SIZE
+    def sticker_face(color_bgr):
+        img = np.zeros((size, size, 3), dtype=np.uint8)
+        img[:] = (18, 18, 18)  # plástico negro de fondo / separaciones entre stickers
 
-    objpoints = []  # puntos 3D reales, uno por captura
-    imgpoints = []  # esquinas 2D detectadas, una por captura
+        border = max(2, size // 18)   # grosor del "surco" negro entre stickers
+        cell = size // 3
 
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001)
+        for row in range(3):
+            for col in range(3):
+                y0, y1 = row * cell + border, (row + 1) * cell - border
+                x0, x1 = col * cell + border, (col + 1) * cell - border
 
-    print(f"Mostrale a la camara un tablero de ajedrez de {CHESSBOARD_SIZE[0]}x{CHESSBOARD_SIZE[1]} esquinas internas.")
-    print("Cuando el tablero se detecte (se van a marcar sus esquinas), presiona 'c' para capturar.")
-    print(f"Se necesitan al menos {MIN_CALIB_SHOTS} capturas desde angulos y distancias distintas.")
-    print("Presiona 'q' para cancelar la calibracion.")
+                # Pequeña variación de tono por sticker, para que no se vea
+                # un color totalmente plano/digital sino con algo de textura
+                # plástica (como el ruido que usaba la versión Minecraft).
+                shade = rng.integers(-8, 8, 3)
+                sticker = np.clip(np.array(color_bgr, dtype=np.int32) + shade, 0, 255)
+                img[y0:y1, x0:x1] = sticker.astype(np.uint8)
 
-    gray = None
-    while len(objpoints) < MIN_CALIB_SHOTS:
-        ret, frame = cap.read()
-        if not ret:
-            break
+        return img
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        found, corners = cv2.findChessboardCorners(gray, CHESSBOARD_SIZE, None)
+    colores_bgr = {
+        'top':    (255, 255, 255),  # blanco
+        'bottom': (0, 213, 255),    # amarillo
+        'front':  (0, 0, 213),      # rojo
+        'back':   (0, 115, 255),    # naranja
+        'left':   (70, 155, 0),     # verde
+        'right':  (200, 70, 0),     # azul
+    }
 
-        display = frame.copy()
-        if found:
-            corners_refined = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
-            cv2.drawChessboardCorners(display, CHESSBOARD_SIZE, corners_refined, found)
+    return {nombre: sticker_face(color) for nombre, color in colores_bgr.items()}
 
-        cv2.putText(display, f"Capturas: {len(objpoints)}/{MIN_CALIB_SHOTS}  ('c' capturar, 'q' cancelar)",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-        cv2.imshow("Calibracion - tablero de ajedrez", display)
 
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('c') and found:
-            objpoints.append(objp)
-            imgpoints.append(corners_refined)
-            print(f"Captura {len(objpoints)}/{MIN_CALIB_SHOTS} guardada.")
-        elif key == ord('q'):
-            print("Calibracion cancelada por el usuario.")
-            cap.release()
-            cv2.destroyAllWindows()
-            exit(1)
+def camera_matrix(w, h):
+    """
+    Matriz intrínseca de cámara aproximada (SIN calibración real).
+    f = focal length estimada como el lado mayor de la imagen (en píxeles).
+    cx, cy = centro óptico asumido en el centro del frame.
+    Esto es intencional: no se pide tablero de ajedrez ni proceso de
+    calibración, a costa de algo de precisión en la pose del cubo.
+    """
+    f = max(w, h)
+    return np.float32([[f, 0, w/2], [0, f, h/2], [0, 0, 1]])
 
-    cv2.destroyWindow("Calibracion - tablero de ajedrez")
 
-    h, w = gray.shape[:2]
-    print("Calculando calibracion...")
-    ret, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.calibrateCamera(
-        objpoints, imgpoints, (w, h), None, None
+def draw_rubiks_cube(frame, pts2d, verts_cam, textures):
+    """
+    Dibuja el cubo sobre el frame usando painter's algorithm:
+    ordena las caras de más lejos a más cerca (por profundidad Z en cámara)
+    y las pinta en ese orden para que las cercanas tapen a las lejanas.
+
+    Para cada cara:
+      1. getPerspectiveTransform: calcula la homografía textura → cuadrilátero 2D.
+      2. warpPerspective: deforma la textura (el sticker 3x3) al cuadrilátero proyectado.
+      3. fillPoly + addWeighted: aplica la textura con opacidad (ALPHA).
+    """
+    h_f, w_f = frame.shape[:2]
+    faces_by_depth = sorted(
+        [(np.mean([verts_cam[i][2] for i in vidx]), vidx, tname) for vidx, tname in FACES],
+        reverse=True,  # painter's algorithm: más lejos primero
     )
-
-    # Error de reproyeccion: que tan bien explican los parametros
-    # calculados los puntos que realmente se vieron. Cuanto mas
-    # cerca de 0, mejor la calibracion (valores tipicos: < 1 px).
-    error_total = 0
-    for i in range(len(objpoints)):
-        proyectados, _ = cv2.projectPoints(objpoints[i], rvecs[i], tvecs[i], camera_matrix, dist_coeffs)
-        error_total += cv2.norm(imgpoints[i], proyectados, cv2.NORM_L2) / len(proyectados)
-    print(f"Error de reproyeccion promedio: {error_total / len(objpoints):.4f} px")
-
-    np.savez(CALIB_FILE, camera_matrix=camera_matrix, dist_coeffs=dist_coeffs)
-    print(f"Calibracion guardada en '{CALIB_FILE}' (la proxima vez se carga automaticamente).")
-
-    cap.release()
-    return camera_matrix.astype(np.float32), dist_coeffs.astype(np.float32)
+    for _, vidx, tname in faces_by_depth:
+        dst = np.array([pts2d[i] for i in vidx], dtype=np.float32)
+        tex = textures[tname]
+        t_h, t_w = tex.shape[:2]
+        src = np.float32([[0, 0], [t_w, 0], [t_w, t_h], [0, t_h]])
+        M = cv2.getPerspectiveTransform(src, dst)
+        warped = cv2.warpPerspective(tex, M, (w_f, h_f), flags=cv2.INTER_NEAREST)
+        mask = np.zeros((h_f, w_f), dtype=np.uint8)
+        cv2.fillPoly(mask, [dst.astype(int)], 255)
+        blended = cv2.addWeighted(frame, 1 - ALPHA, warped, ALPHA, 0)
+        frame[mask > 0] = blended[mask > 0]
 
 
-def cargar_o_calibrar():
-    """Si ya existe una calibracion guardada la reutiliza; si no, calibra de cero."""
-    if os.path.exists(CALIB_FILE):
-        data = np.load(CALIB_FILE)
-        print(f"Calibracion cargada desde '{CALIB_FILE}'.")
-        return data["camera_matrix"].astype(np.float32), data["dist_coeffs"].astype(np.float32)
-    print("No se encontro una calibracion previa.")
-    return calibrar_camara()
+class AR3DApp(App):
+    title = "ArUco 3D - Rubik's Cube"
+
+    def build(self):
+        """Inicializa la app: widget de imagen, detector ArUco, hilo de cámara y timer de UI."""
+        self.img_widget = KivyImage()
+        self.textures = make_textures()
+        self.dist = np.zeros(4)   # coeficientes de distorsión (sin calibración = cero)
+        self.K = None             # matriz de cámara, se calcula al recibir el primer frame
+        self.poses = {}           # {marker_id: [rvec, tvec, frames_sin_detectar]}
+        self.kv_tex = None        # textura Kivy reutilizable (evita crearla cada frame)
+        self._frame = None        # último frame procesado, compartido entre threads
+        self._lock = threading.Lock()
+
+        params = cv2.aruco.DetectorParameters()
+        params.cornerRefinementMethod    = cv2.aruco.CORNER_REFINE_SUBPIX
+        params.minMarkerPerimeterRate      = 0.05
+        params.adaptiveThreshWinSizeMin    = 7
+        params.adaptiveThreshWinSizeMax    = 23
+        params.adaptiveThreshWinSizeStep   = 8
+        params.polygonalApproxAccuracyRate = 0.03
+        params.errorCorrectionRate         = 0.6
+        self.detector = cv2.aruco.ArucoDetector(
+            cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_250), params
+        )
+
+        threading.Thread(target=self._capture_loop, daemon=True).start()
+        Clock.schedule_interval(self.update, 1 / 60)
+        return self.img_widget
+
+    def _capture_loop(self):
+        """
+        Hilo dedicado a la cámara: captura frames, detecta marcadores ArUco,
+        calcula la pose con solvePnP y dibuja el cubo antes de pasar el frame a la UI.
+        """
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            print("ERROR: no se pudo abrir la cámara")
+            return
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                time.sleep(0.01)
+                continue
+            if self.K is None:
+                h, w = frame.shape[:2]
+                self.K = camera_matrix(w, h)
+
+            corners, ids, _ = self.detector.detectMarkers(frame)
+            detected_ids = set()
+            if ids is not None:
+                for corner, mid in zip(corners, ids.flatten()):
+                    if cv2.contourArea(corner[0]) < 400:
+                        continue
+                    ok, rvec, tvec = cv2.solvePnP(
+                        MARKER_OBJ_PTS, corner[0], self.K, self.dist,
+                        flags=cv2.SOLVEPNP_IPPE_SQUARE,
+                    )
+                    if ok:
+                        self.poses[mid] = [rvec, tvec, 0]
+                        detected_ids.add(mid)
+
+            for mid in list(self.poses):
+                if mid not in detected_ids:
+                    self.poses[mid][2] += 1
+                    if self.poses[mid][2] > 8:
+                        del self.poses[mid]
+
+            for rvec, tvec, _ in self.poses.values():
+                pts2d, _ = cv2.projectPoints(CUBE_VERTS, rvec, tvec, self.K, self.dist)
+                pts2d = pts2d.reshape(-1, 2)
+                R, _ = cv2.Rodrigues(rvec)
+                verts_cam = (R @ CUBE_VERTS.T + tvec).T
+                draw_rubiks_cube(frame, pts2d, verts_cam, self.textures)
+
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame = cv2.flip(frame, 0)
+            with self._lock:
+                self._frame = frame
+
+    def update(self, dt):
+        """Llamada 60 veces/seg por Kivy: copia el último frame y lo sube a la textura de la UI."""
+        with self._lock:
+            if self._frame is None:
+                return
+            frame = self._frame.copy()
+        h, w, _ = frame.shape
+        if self.kv_tex is None:
+            self.kv_tex = Texture.create(size=(w, h))
+        self.kv_tex.blit_buffer(frame.tobytes(), colorfmt='rgb', bufferfmt='ubyte')
+        self.img_widget.texture = self.kv_tex
+        self.img_widget.canvas.ask_update()
 
 
-def dibujar_cubo_solido(frame, rvec, tvec, camera_matrix, dist_coeffs):
-    """
-    Proyecta el cubo 3D sobre el frame y dibuja sus 6 caras como
-    poligonos SOLIDOS (en vez del wireframe de la version anterior).
-
-    Algoritmo del pintor: se ordenan las caras de la mas lejana a la
-    mas cercana (segun la profundidad Z de cada cara en el sistema de
-    coordenadas de la CAMARA, no del marcador) y se dibujan en ese
-    orden, para que las caras cercanas tapen correctamente a las que
-    quedan detras.
-
-    Ademas se aplica un sombreado simple: la normal de cada cara se
-    compara con la direccion hacia la camara, y las caras mas de
-    frente se dibujan mas brillantes que las caras de perfil, dando
-    sensacion de volumen sin necesidad de texturas.
-    """
-    img_pts, _ = cv2.projectPoints(cube_3d_points, rvec, tvec, camera_matrix, dist_coeffs)
-    img_pts = img_pts.reshape(-1, 2)
-
-    # Matriz de rotacion 3x3 a partir del vector de rotacion (Rodrigues)
-    R, _ = cv2.Rodrigues(rvec)
-    # Vertices del cubo pasados al sistema de coordenadas de la camara
-    verts_cam = (R @ cube_3d_points.T + tvec.reshape(3, 1)).T
-
-    caras_ordenadas = sorted(
-        CUBE_FACES,
-        key=lambda cara: np.mean([verts_cam[i][2] for i in cara[0]]),
-        reverse=True  # painter's algorithm: se dibuja primero lo mas lejos
-    )
-
-    overlay = frame.copy()
-    for indices, color in caras_ordenadas:
-        pts2d = img_pts[indices].astype(np.int32)
-
-        # Normal de la cara en espacio camara, para el sombreado
-        p0, p1, p2 = verts_cam[indices[0]], verts_cam[indices[1]], verts_cam[indices[2]]
-        normal = np.cross(p1 - p0, p2 - p0)
-        norma = np.linalg.norm(normal)
-        if norma > 1e-9:
-            normal = normal / norma
-
-        # La camara mira hacia +Z, entonces las caras cuya normal
-        # apunta hacia la camara (Z negativa) se ven "de frente" y
-        # se iluminan mas; las de perfil quedan mas oscuras.
-        brillo = 0.45 + 0.55 * max(0.0, -normal[2])
-        color_sombreado = tuple(int(c * brillo) for c in color)
-
-        cv2.fillConvexPoly(overlay, pts2d, color_sombreado)
-        cv2.polylines(overlay, [pts2d], isClosed=True, color=(20, 20, 20), thickness=2)
-
-    # Mezcla el overlay con el frame original (ALPHA < 1 deja ver
-    # un poco el fondo debajo del cubo, sensacion de semitransparencia leve)
-    ALPHA = 0.9
-    cv2.addWeighted(overlay, ALPHA, frame, 1 - ALPHA, 0, dst=frame)
-
-
-def main():
-    camera_matrix, dist_coeffs = cargar_o_calibrar()
-    print("Matriz de camara:\n", camera_matrix)
-    print("Coeficientes de distorsion:\n", dist_coeffs)
-
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("Error: No se pudo abrir la camara.")
-        return
-
-    # Configurar el detector ArUco
-    aruco_dict = aruco.getPredefinedDictionary(aruco.DICT_6X6_250)
-    parameters = aruco.DetectorParameters()
-    detector = aruco.ArucoDetector(aruco_dict, parameters)
-
-    print("Presiona 'q' para salir.")
-
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        corners, ids, rejected = detector.detectMarkers(gray)
-
-        if ids is not None:
-            for i in range(len(ids)):
-                img_points = corners[i][0]
-
-                success, rvec, tvec = cv2.solvePnP(
-                    marker_3d_points, img_points, camera_matrix, dist_coeffs
-                )
-
-                if success:
-                    dibujar_cubo_solido(frame, rvec, tvec, camera_matrix, dist_coeffs)
-
-        cv2.imshow('ArUco 3D - Cubo solido (camara calibrada)', frame)
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
-
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    AR3DApp().run()
